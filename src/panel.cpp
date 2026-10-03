@@ -45,20 +45,24 @@ InlineBody buildBody(const Message& m) {
   return b;
 }
 
-/** Card height, from arithmetic alone. Deliberately not measured with pango: paintRow needs the
- *  height while it already holds the single TextRenderer layout, and a nested layout call would
- *  clobber it. */
-double cardHeight(const Message& m, double nameSize, double amountSize, double bodySize,
-                  double lineHeight, double rowGap) {
-  double h = nameSize * lineHeight;
-  if (!m.amount.empty()) h += amountSize * lineHeight;
-  if (!m.parts.empty()) h += bodySize * lineHeight;
-  return h + rowGap * 2.0;
-}
-
 }  // namespace
 
 Panel::Panel(PanelTokens tokens) : tok_(std::move(tokens)) {}
+
+double Panel::measureLineHeight(cairo_t* cr, double sizePx) const {
+  // Measured off a probe string rather than computed: the line box is the font's own ascent plus
+  // descent, which depends on which family in the chain answered and is not something the stylesheet
+  // can state. "Hg" is used because it carries both an ascender and a descender, so the probe
+  // cannot come out shorter than a line of CJK or of digits.
+  pwvideo::LabelSpec spec;
+  spec.family = tok_.font;
+  spec.sizePx = sizePx;
+  spec.maxLines = 1;
+  const int h = pwvideo::TextRenderer::measure(text_.layout(cr, "Hg", spec)).height;
+  return h > 0 ? static_cast<double>(h) : sizePx;
+}
+
+double Panel::avatarBox() const { return avatarBox_ > 0.0 ? avatarBox_ : tok_.avatar; }
 
 void Panel::resize(int width, int height) {
   if (width == width_ && height == height_) return;
@@ -69,6 +73,9 @@ void Panel::resize(int width, int height) {
   layer_.reset(cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width_, height_),
                pwvideo::CairoSurfaceDeleter{});
   layerCr_ = pwvideo::ContextPtr(cairo_create(layer_.get()));
+  // The face is drawn as tall as the text beside it, so the box is measured rather than declared.
+  // It depends only on the tokens, which are fixed at construction, hence once per resize.
+  avatarBox_ = measureLineHeight(layerCr_.get(), tok_.fontBody);
   clear();
 }
 
@@ -110,12 +117,44 @@ uint32_t Panel::nameColor(UserType t) const {
   }
 }
 
+std::vector<Panel::CardLine> Panel::cardLines(const Message& m, cairo_t* cr, double w) const {
+  pwvideo::LabelSpec spec;
+  spec.family = tok_.font;
+  spec.center = false;
+  spec.bold = true;
+  spec.widthPx = std::max(20.0, w - 2 * tok_.padX);
+  spec.maxLines = 1;  // a card line is never wrapped; the body is ellipsized instead
+
+  std::vector<CardLine> lines;
+  lines.reserve(3);
+  const std::string body = m.plainText();
+  const std::pair<const std::string*, double> src[] = {
+      {&m.user, tok_.fontCardName}, {&m.amount, tok_.fontCardAmount}, {&body, tok_.fontBody}};
+  for (const auto& s : src) {
+    if (s.first->empty()) continue;
+    CardLine l;
+    l.text = *s.first;
+    l.size = s.second;
+    spec.sizePx = l.size;
+    l.height =
+        static_cast<double>(pwvideo::TextRenderer::measure(text_.layout(cr, l.text, spec)).height);
+    lines.push_back(std::move(l));
+  }
+  return lines;
+}
+
+double Panel::cardHeight(const Message& m, cairo_t* cr, double w) const {
+  double content = 0.0;
+  for (const CardLine& l : cardLines(m, cr, w)) content += l.height;
+  // Padding above and below the text, plus the gap that separates this card from the next one.
+  return content + tok_.rowGap * 3.0;
+}
+
 double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   const bool card = m.kind != MsgKind::Text;
   if (isCard) *isCard = card;
   if (card) {
-    return cardHeight(m, tok_.fontCardName, tok_.fontCardAmount, tok_.fontBody, tok_.lineHeight,
-                      tok_.rowGap);
+    return cardHeight(m, cr, static_cast<double>(width_));
   }
 
   // Must agree with paintRow about where the body wraps, or a row is allocated too short and its
@@ -133,11 +172,14 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   int nw = 0, nh = 0;
   pango_layout_get_pixel_size(text_.layout(cr, m.user + ":", ns), &nw, &nh);
 
-  const double textX = tok_.padX + tok_.avatar + tok_.avatarGap;
+  const double textX = tok_.padX + avatarBox() + tok_.avatarGap;
   const double avail = static_cast<double>(width_) - textX - tok_.padRight;
 
   spec.sizePx = tok_.fontBody;
-  spec.widthPx = std::max(20.0, avail - nw);
+  // The gap after "name:" is part of what the first line has to fit, so it is subtracted here as
+  // well as being applied when painting. Measuring without it would wrap one word too late and
+  // measureRow would allocate the row a line too short.
+  spec.widthPx = std::max(20.0, avail - nw - tok_.nameBodyGap);
   spec.maxLines = 8;
   // Count lines on the laid-out string, emotes included: a line of nothing but an emote still takes
   // a line, and plainText() would measure a different string than the one actually drawn.
@@ -145,7 +187,7 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   PangoLayout* l = text_.layout(cr, body.text, spec);
   const int lines = std::max(1, pango_layout_get_line_count(l));
   const double textH = static_cast<double>(lines) * tok_.fontBody * tok_.lineHeight;
-  return std::max(textH, tok_.avatar) + tok_.rowGap;
+  return std::max(textH, avatarBox()) + tok_.rowGap;
 }
 
 void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy, double d) const {
@@ -158,6 +200,12 @@ void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy
 
   pwvideo::SurfacePtr surf;
   if (avatars_) surf = avatars_->lookup(url);
+  // The offline demo's synthetic faces, looked up only after the store missed: a fetched picture
+  // always wins, so installing a demo table can never hide a real face in a live run.
+  if (!surf) {
+    const auto it = demoFaces_.find(url);
+    if (it != demoFaces_.end()) surf = it->second;
+  }
   if (surf) {
     // Scale the picture into the box instead of assuming it is already the right size. cairo
     // anchors a source surface at its top-left corner, so a surface larger than the box would be
@@ -175,7 +223,9 @@ void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy
   } else {
     // Placeholder disc. Because avatars are drawn live rather than baked, this is genuinely
     // transient: the next frame after the picture lands shows the picture. It is still worth
-    // distinguishing, since the site default avatar is itself a flat grey figure.
+    // distinguishing, since the site default avatar is itself a flat grey figure. In the offline
+    // demo nothing ever arrives, so a grey disc here means the demo message carried no picture at
+    // all rather than that one had not been fetched.
     cairo_set_source_rgba(cr, 0.55, 0.58, 0.62, 1.0);
   }
   cairo_paint(cr);
@@ -191,7 +241,8 @@ void Panel::drawAvatars(cairo_t* cr) const {
   // text. Drawing it here as well would paint it a second time at the untranslated position, so the
   // avatar would sit still while the line beside it slid in.
   const double top = contentH_ - static_cast<double>(height_);
-  const double cx = tok_.padX + tok_.avatar / 2.0;
+  const double box = avatarBox();
+  const double cx = tok_.padX + box / 2.0;
   const size_t skipTail = animating_ && !rows_.empty() ? 1 : 0;
   const size_t n = rows_.size() - skipTail;
   for (size_t i = 0; i < n; ++i) {
@@ -204,7 +255,7 @@ void Panel::drawAvatars(cairo_t* cr) const {
     // while the row being animated is placed from height_ - animRowH_ and is therefore correct --
     // which is what makes the sliding avatar look like it does not line up with the rest.
     const double screenTop = static_cast<double>(height_) - (contentH_ - r.y);
-    drawAvatar(cr, r.avatarUrl, cx, screenTop + tok_.avatar / 2.0, tok_.avatar);
+    drawAvatar(cr, r.avatarUrl, cx, screenTop + box / 2.0, box);
   }
 }
 
@@ -265,41 +316,41 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     const pwvideo::Rgba bg = m.kind == MsgKind::Membership
                                  ? rgb(tok_.cardMembership, 1.0)
                                  : rgb(0x00B8D4, tok_.cardPaidAlpha);
-    const double h = cardHeight(m, tok_.fontCardName, tok_.fontCardAmount, tok_.fontBody,
-                                tok_.lineHeight, tok_.rowGap) -
-                     tok_.rowGap * 2.0;
-    pwvideo::roundedRect(cr, x, y, w, h, 6.0);
+
+    // The background is sized from the measured lines, not from arithmetic. Every height here comes
+    // out of the same cardLines() call that measureRow used to allocate the row, so the card is
+    // exactly as tall as the text in it.
+    const std::vector<CardLine> lines = cardLines(m, cr, w);
+    double content = 0.0;
+    for (const CardLine& l : lines) content += l.height;
+
+    const double pad = tok_.rowGap;
+    pwvideo::roundedRect(cr, x, y, w, content + pad * 2.0, 6.0);
     cairo_set_source_rgba(cr, bg.r, bg.g, bg.b, bg.a);
     cairo_fill(cr);
 
-    double ly = y + tok_.rowGap;
+    // Laid out a second time on the way past: cardLines() spent the renderer's single PangoLayout
+    // on measuring, so each line has to be rebuilt before it can be drawn.
     const double px = x + tok_.padX;
-    auto line = [&](const std::string& s, double size) {
-      if (s.empty()) return;
-      spec.sizePx = size;
-      spec.widthPx = w - 2 * tok_.padX;
-      spec.maxLines = 1;
-      outlined(text_.layout(cr, s, spec), px, ly, rgb(tok_.body));
-      ly += size * tok_.lineHeight;
-    };
-    line(m.user, tok_.fontCardName);
-    line(m.amount, tok_.fontCardAmount);
-    line(m.plainText(), tok_.fontBody);
-    return ly - y;
+    double ly = y + pad;
+    for (const CardLine& l : lines) {
+      pwvideo::LabelSpec cs = spec;
+      cs.sizePx = l.size;
+      cs.widthPx = w - 2 * tok_.padX;
+      cs.maxLines = 1;
+      outlined(text_.layout(cr, l.text, cs), px, ly, rgb(tok_.body));
+      ly += l.height;
+    }
+    return ly - y + pad;  // the bottom padding closes the card
   }
 
   // Plain line: the role-coloured bar at the far left, then a gap for the avatar, then "name: body".
-  const pwvideo::Rgba bar = rgb(barColor(m.type), m.type == UserType::Normal ? 0.5 : 1.0);
-  cairo_set_source_rgba(cr, bar.r, bar.g, bar.b, bar.a);
-  pwvideo::roundedRect(cr, x + tok_.barX, y + tok_.barInset, tok_.barWidth,
-                       tok_.avatar - tok_.barInset * 2.0, 1.0);
-  cairo_fill(cr);
 
   // The avatar is not drawn here. It is painted per frame by drawAvatars(), so that a face which
   // arrives after this row has been laid out still appears; baking it here would freeze whatever
   // was in the cache at that instant, which is usually the placeholder disc.
 
-  const double textX = x + tok_.padX + tok_.avatar + tok_.avatarGap;
+  const double textX = x + tok_.padX + avatarBox() + tok_.avatarGap;
   const double avail = w - textX - tok_.padRight;
 
   // The name is measured rather than assumed: it can be latin or CJK, and the widths differ enough
@@ -315,19 +366,35 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   double ty = y;
   outlined(nl, textX, ty, rgb(nc));
 
-  const double bodyX = textX + nw;
+  const double bodyX = textX + nw + tok_.nameBodyGap;
   // Emotes become object-replacement characters before layout, so pango does the line breaking and
   // places the placeholders. Each visual line is then split back at them and drawn as text runs
   // and pictures in a single pass.
   const InlineBody body = buildBody(m);
   pwvideo::LabelSpec bs = spec;
   bs.sizePx = tok_.fontBody;
-  bs.widthPx = std::max(20.0, avail - nw);  // the first line shares the row with the name
+  bs.widthPx = std::max(20.0, avail - nw - tok_.nameBodyGap);  // the first line shares the row with the name
   bs.maxLines = 8;
   PangoLayout* bl = text_.layout(cr, body.text, bs);
 
   const int nLines = std::max(1, pango_layout_get_line_count(bl));
   const double lh = tok_.fontBody * tok_.lineHeight;
+
+  // The bar spans the whole content height of the row, so a wrapped message gets a bar as long as
+  // the text it belongs to. It is drawn here rather than before the body was laid out because its
+  // height is the line count -- and it cannot be painted over, being 4px from the edge while the
+  // text starts at padX. The margin below the row is left out on purpose: that is the gap to the
+  // next message, and a bar reaching into it would read as belonging to both rows.
+  {
+    const pwvideo::Rgba bar = rgb(barColor(m.type), m.type == UserType::Normal ? 0.5 : 1.0);
+    cairo_set_source_rgba(cr, bar.r, bar.g, bar.b, bar.a);
+    // Square corners: the bar is flush against the panel edge, so rounding its ends would only
+    // carve notches out of the very edge it is meant to sit on.
+    cairo_rectangle(cr, x + tok_.barX, y + tok_.barInset, tok_.barWidth,
+                    std::max(static_cast<double>(nLines) * lh, avatarBox()) -
+                        tok_.barInset * 2.0);
+    cairo_fill(cr);
+  }
 
   // Collect the line boundaries before drawing anything. TextRenderer owns a single PangoLayout,
   // so laying out a run inside this loop rebinds that same layout and the line list being walked
@@ -501,8 +568,8 @@ void Panel::render(cairo_t* cr, int64_t nowMs) {
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
   // Avatars for every settled row, painted live rather than baked into the layer. They are small
-  // (a 24 px disc, a few dozen of them) and this is what makes a face that arrives late still show
-  // up: nothing has to be repainted, it is simply there on the next frame.
+  // (one line box square, a few dozen of them) and this is what makes a face that arrives late
+  // still show up: nothing has to be repainted, it is simply there on the next frame.
   drawAvatars(cr);
 
   if (!animating_) return;
@@ -516,9 +583,10 @@ void Panel::render(cairo_t* cr, int64_t nowMs) {
   paintRow(cr, anim_, 0.0, height_ - animRowH_, static_cast<double>(width_));
   // Its own avatar goes inside the group too, so it slides and fades with the row instead of
   // standing still while the text beside it moves.
-  if (!anim_.avatarUrl.empty())
-    drawAvatar(cr, anim_.avatarUrl, tok_.padX + tok_.avatar / 2.0,
-               height_ - animRowH_ + tok_.avatar / 2.0, tok_.avatar);
+  if (!anim_.avatarUrl.empty()) {
+    const double box = avatarBox();
+    drawAvatar(cr, anim_.avatarUrl, tok_.padX + box / 2.0, height_ - animRowH_ + box / 2.0, box);
+  }
   cairo_pop_group_to_source(cr);
   cairo_paint_with_alpha(cr, t);
   cairo_restore(cr);

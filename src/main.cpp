@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,6 +26,7 @@
 #include "images.hpp"
 #include "bili.hpp"
 #include "cairo_util.hpp"
+#include "demo_faces.hpp"
 #include "message.hpp"
 #include "panel.hpp"
 #include "pwvideo.hpp"
@@ -77,6 +79,10 @@ void usage(std::FILE* out) {
       "  --cookie-file PATH Read the cookie from a file instead; recommended, since the file can\n"
       "                     be chmod 600 and the value never reaches the process arguments.\n"
       "  --font NAME[,...]  Font family chain for the panel, default a CJK-capable fallback chain\n"
+      "  --font-size N      Chat text size in px, for the username and the body. Default 28.\n"
+      "                     The avatar box follows it: it is always one line tall.\n"
+      "  --card-font-size N Card text size in px, for the paid and membership card lines.\n"
+      "                     Default 30, the same size the chat uses plus 2.\n"
       "  --font-file PATH   Register a font file (or a directory) with fontconfig at startup;\n"
       "                     repeatable. Without --font its own family name is used\n"
       "  --node NAME        PipeWire node name, default pw-live-danmaku\n"
@@ -105,6 +111,9 @@ struct Options {
   std::vector<std::string> fontFiles;
   std::string font;
   int width = 480, height = 1080, fps = 30, count = 0, seconds = 0;
+  // 0 means "not given", so an unset flag leaves PanelTokens' own default in place rather than
+  // restating it here: the two would otherwise drift apart the first time one of them is edited.
+  double fontSize = 0.0, cardFontSize = 0.0;
   bool verbose = false, demo = false;
 };
 
@@ -126,6 +135,12 @@ Args parseArgs(int argc, char** argv, Options& o) {
       o.cookieFile = next(i);
     } else if (a == "--font") {
       o.font = next(i);
+    } else if (a == "--font-size") {
+      // Clamped rather than trusted: a size that small makes pango refuse to lay out at all, and a
+      // size that large silently produces one word per line. Both are worse than a range error.
+      o.fontSize = std::clamp(std::stod(next(i)), 8.0, 200.0);
+    } else if (a == "--card-font-size") {
+      o.cardFontSize = std::clamp(std::stod(next(i)), 8.0, 200.0);
     } else if (a == "--font-file") {
       o.fontFiles.push_back(next(i));
     } else if (a == "--node") {
@@ -394,12 +409,16 @@ std::vector<Message> demoMessages() {
   paid.kind = MsgKind::Paid;
   paid.user = "五条悟";
   paid.amount = "CN¥30.0";
+  // The body of a paid card is its third line, and a real SUPER_CHAT always has one. Leaving it
+  // out here is what let the card be painted shorter than the text in it go unnoticed.
+  paid.parts.emplace_back(Fragment{Fragment::Kind::Text, "醒目留言：第三行必须待在卡片里", "", 0});
   out.push_back(paid);
 
   Message paid2;
   paid2.kind = MsgKind::Paid;
   paid2.user = "ディオ・ブランドー";
   paid2.amount = "CN¥50.0";
+  paid2.parts.emplace_back(Fragment{Fragment::Kind::Text, "A paid card whose body wraps nowhere", "", 0});
   out.push_back(paid2);
 
   Message sub;
@@ -412,6 +431,16 @@ std::vector<Message> demoMessages() {
   after.user = "友好的益生菌";
   after.parts.emplace_back(Fragment{Fragment::Kind::Text, "弹幕姬启动", "", 0});
   out.push_back(after);
+
+  // Every chat row asks for a synthetic face. Without this the demo draws no avatar at all, and a
+  // missing avatar is indistinguishable from one drawn into the wrong box -- which is the whole
+  // thing the red-and-green grids exist to reveal. The cards keep an empty URL, matching a live
+  // paid message, which has no face.
+  int face = 0;
+  for (Message& m : out) {
+    if (m.kind != MsgKind::Text) continue;
+    m.avatarUrl = demoFaceKey(face++);
+  }
   return out;
 }
 
@@ -468,20 +497,53 @@ int main(int argc, char** argv) {
 
   PanelTokens tokens = defaultTokens();
   if (!o.font.empty()) tokens.font = o.font;
+  if (o.fontSize > 0.0) {
+    tokens.fontUser = o.fontSize;
+    tokens.fontBody = o.fontSize;
+    // An emote is a picture sitting in the text flow, so its box follows the text it sits in; left
+    // at its own default it would shrink to a stamp as soon as the font grew.
+    tokens.emote = o.fontSize;
+    // The card keeps its step above the chat text, which is what the defaults describe: one size
+    // knob for the chat and one for the cards, rather than every knob having to know about the
+    // others.
+    tokens.fontCardName = tokens.fontBody + 2.0;
+    tokens.fontCardAmount = tokens.fontBody;
+  }
+  if (o.cardFontSize > 0.0) {
+    tokens.fontCardName = o.cardFontSize;
+    tokens.fontCardAmount = o.cardFontSize;
+  }
 
   Shared sh;
   sh.roomLabel = o.demo ? std::string("demo") : o.room;
-  // 48 px decoded into a 24 px box, so the face stays crisp on a hidpi canvas without storing four
-  // times the pixels it needs. The capacity is separate and only bounds memory: a busy room shows
-  // roughly 36 rows, and a visible row's avatar has to outlive the messages that push it off.
-  ImageStore avatars(48, 256, bili.userAgent());
+
+  // The panel is built before the image stores because the stores have to be told how large to
+  // decode: the avatar box is one line of body text, so it is only known once the font is measured,
+  // and a face decoded at the wrong size is either soft or needlessly large in memory.
+  Panel panel(tokens);
+  panel.resize(o.width, o.height);
+
+  // Decoded at twice the box, so the face stays crisp on a hidpi canvas without storing four times
+  // the pixels it needs. The capacity is separate and only bounds memory: a busy room shows roughly
+  // 36 rows, and a visible row's avatar has to outlive the messages that push it off.
+  const int facePx = std::clamp(static_cast<int>(panel.avatarBox() * 2.0), 32, 256);
+  ImageStore avatars(facePx, 256, bili.userAgent());
   // Emotes are a small closed set reused by everyone, so they are worth far more entries than a
   // face is; 48 px is enough at the 24 px box they are drawn into.
   ImageStore emoteImages(48, 512, bili.userAgent());
-  Panel panel(tokens);
   panel.setImageStore(&avatars);
   panel.setEmoteStore(&emoteImages);
-  panel.resize(o.width, o.height);
+
+  /** The demo's synthetic faces, keyed the way demoMessages() asks for them. Installed only for
+   *  --demo: in a live run the store is the source of truth and this table stays empty, so a real
+   *  face can never be shadowed by a test pattern. */
+  auto installDemoFaces = [&] {
+    std::map<std::string, pwvideo::SurfacePtr> table;
+    const std::vector<pwvideo::SurfacePtr> faces = demoFaces();
+    for (size_t i = 0; i < faces.size(); ++i)
+      table[demoFaceKey(static_cast<int>(i))] = faces[i];
+    panel.setDemoFaces(std::move(table));
+  };
   pwvideo::CairoFrame frame(o.width, o.height);
 
   // Reused across frames so the render path does not allocate.
@@ -507,6 +569,7 @@ int main(int argc, char** argv) {
   if (o.demo) {
     // Everything is known up front, so paint the list in one go rather than row by row.
     sh.setState("demo (no network)");
+    installDemoFaces();
     panel.rebuildLayer(demoMessages());
     if (!o.dump.empty()) {
       panel.render(frame.cr(), steadyMs());

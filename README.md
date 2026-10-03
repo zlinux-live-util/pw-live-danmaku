@@ -94,6 +94,8 @@ chmod 600 ~/.config/pw-live-danmaku/cookie
 | `--cookie STR` | | cookie 字符串。会进 `ps(1)`，程序会警告 |
 | `--cookie-file PATH` | | 从文件读 cookie（推荐，可 `chmod 600`） |
 | `--font NAME[,...]` | CJK 回退链 | pango 逐字符回退，拉丁与中文字体可以串成一条链 |
+| `--font-size N` | `28` | 聊天区字号（用户名与正文）。头像框随之为一行文字高 |
+| `--card-font-size N` | `30` | 醒目留言 / 舰长卡片内的字号 |
 | `--font-file PATH` | | 启动时把字体文件注册进 fontconfig；可重复 |
 | `--node NAME` | `pw-live-danmaku` | PipeWire 节点名 |
 | `--desc TEXT` | `Live Chat` | 节点描述，**OBS 下拉框里显示的就是它** |

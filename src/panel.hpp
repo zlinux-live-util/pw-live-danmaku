@@ -18,6 +18,7 @@
 //     back to a single copy.
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -32,25 +33,29 @@ namespace dwm {
 
 /** One field per custom property in the reference stylesheet. */
 struct PanelTokens {
-  double avatar = 24.0;      // --avatar-size
+  double avatar = 24.0;      // fallback avatar box, used only before the first measurement; the box
+                             // itself is one line of body text as pango lays it out
   double avatarGap = 10.0;   // avatar margin-right
-  double emote = 24.0;       // --emote-size; inline emotes are drawn at this box
-  double fontUser = 20.0;    // --username-size
-  double fontBody = 20.0;    // --text-content-size
-  double fontCardName = 22.0;   // --paid-msg-line-1-size
-  double fontCardAmount = 20.0; // --paid-msg-line-2-size
+  double emote = 28.0;       // box an inline emote is drawn into. Tracks --font-size (main.cpp keeps
+                             // them equal), because a picture in the text flow that is smaller than
+                             // the text beside it reads as a mistake rather than as an emote
+  double fontUser = 28.0;    // --username-size
+  double fontBody = 28.0;    // --text-content-size
+  double fontCardName = 30.0;   // --paid-msg-line-1-size
+  double fontCardAmount = 28.0; // --paid-msg-line-2-size
   double lineHeight = 1.2;   // --line-height, a multiple of the font size
 
   double padX = 20.0;        // padding-inline start
   double padRight = 4.0;     // padding-inline end
+  double nameBodyGap = 6.0;  // space between "name:" and the body on the line they share
   double rowGap = 4.0;       // margin between messages; the stylesheet gives cards 4px, and plain
                              // lines are spaced the same so the column reads as one rhythm
 
-  // The left colour bar: position absolute at left 8px, inset 4px top and bottom, 2px wide,
-  // radius 2px.
-  double barX = 8.0;
-  double barWidth = 2.0;
-  double barInset = 4.0;
+  // The left colour bar: position absolute flush against the panel edge (left 0), square corners,
+  // and as tall as the text block of its row -- barInset trims that height from each end if wanted.
+  double barX = 0.0;
+  double barWidth = 8.0;
+  double barInset = 0.0;
 
   double outline = 1.5;      // text-shadow 0 0 2px, expressed as the stroke width we use
   double animMs = 200.0;     // animation duration
@@ -62,8 +67,9 @@ struct PanelTokens {
   uint32_t barModerator = 0x5E84F1;
   uint32_t barOwner = 0xFFD600;
 
-  // --username-color, per author type
-  uint32_t nameNormal = 0xEAEAEA;
+  // --username-color, per author type. Ordinary names sit well below the body white: the name
+  // repeats on every row, so at body brightness the column reads as solid text.
+  uint32_t nameNormal = 0x9AA0A6;
   uint32_t nameMember = 0x0F9D58;
   uint32_t nameModerator = 0x5E84F1;
   uint32_t nameOwner = 0xFFD600;
@@ -104,6 +110,12 @@ class Panel {
    *  face per viewer versus the same handful of emotes all evening. */
   void setImageStore(ImageStore* store) { avatars_ = store; }
   void setEmoteStore(ImageStore* store) { emotes_ = store; }
+  /** Demo-only: faces drawn in place of fetched ones, keyed by the URL the demo message carries.
+   *  Empty in a live run, where the image stores are the only source. Consulted after the store
+   *  misses, so an installed demo table cannot shadow a face that really was fetched. */
+  void setDemoFaces(std::map<std::string, pwvideo::SurfacePtr> faces) {
+    demoFaces_ = std::move(faces);
+  }
 
   /** Appends messages that arrived since the last call, and repaints only what changed. nowMs is the
    *  clock the entrance animation is timed against. Returns true when anything was redrawn.
@@ -127,6 +139,9 @@ class Panel {
   bool animating() const { return animating_; }
   /** Drops all history and clears the picture. */
   void clear();
+  /** Side of the square the face is drawn in: one line of body text, as pango lays it out. Measured
+   *  once per resize, since it is a property of the font and the size, not of any message. */
+  double avatarBox() const;
   /** Paints a whole list at once, anchored to the bottom. The offline --demo path and any future
    *  "replay this file" path go through here: when every message is known up front there is nothing
    *  to gain from the incremental append, and it avoids the entrance animation, which is meant for
@@ -134,7 +149,26 @@ class Panel {
   void rebuildLayer(const std::vector<Message>& msgs);
 
  private:
+  /** One line of a card, laid out and measured. */
+  struct CardLine {
+    std::string text;
+    double size = 0.0;
+    /** pango's own height for a line of this text at this size. Not size*lineHeight: a CJK face
+     *  carries ascent+descent well past 1.0em, so the arithmetic figure came out shorter than the
+     *  glyphs it was supposed to hold -- which is how a card's last line ended up outside it. */
+    double height = 0.0;
+  };
+
+  /** The lines a card draws, each measured. The row height and the background behind the text both
+   *  come out of this one call, so they cannot disagree about how tall the card is. */
+  std::vector<CardLine> cardLines(const Message& m, cairo_t* cr, double w) const;
+  /** Height a card occupies in the list: its text plus padding, plus the gap below it. */
+  double cardHeight(const Message& m, cairo_t* cr, double w) const;
   double measureRow(const Message& m, cairo_t* cr, bool* isCard) const;
+  /** Height pango gives one line of text at this size. Not sizePx*lineHeight: a CJK face carries
+   *  ascent+descent well past 1.0em, so the arithmetic figure is shorter than the glyphs it would
+   *  have to hold. */
+  double measureLineHeight(cairo_t* cr, double sizePx) const;
   double paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const;
   /** Moves the accumulated picture up by h and clears the strip that opens at the bottom, without
    *  painting into it. The newest message reserves its slot through this, so the rows below it move
@@ -162,6 +196,11 @@ class Panel {
   PanelTokens tok_;
   ImageStore* avatars_ = nullptr;
   ImageStore* emotes_ = nullptr;
+  // Offline demo pictures, keyed by the URL the demo message carries. Empty otherwise.
+  std::map<std::string, pwvideo::SurfacePtr> demoFaces_;
+  // Measured in resize() and read by the layout and by the per-frame avatar pass alike, so the
+  // avatar cannot drift from the text it belongs to when the font size changes.
+  double avatarBox_ = 0.0;
 
   int width_ = 0;
   int height_ = 0;
