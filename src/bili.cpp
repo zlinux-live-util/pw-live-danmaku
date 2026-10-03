@@ -465,6 +465,37 @@ bool Bili::forEachJson(std::string_view message, const JsonVisitor& fn) {
   return true;
 }
 
+namespace {
+
+/** Returns j when it is already an object, otherwise parses it as a JSON string and returns that.
+ *
+ *  bilibili is inconsistent about the same field arriving either way: info[0][13] (the emote
+ *  options) came as a nested object on the wire, while info[0][14] (the voice config) in the very
+ *  same message arrived as the string "{}". Both spellings have to be read, so the two paths are
+ *  normalised here rather than at every call site. */
+const Json& objectOrJson(const Json& j) {
+  if (j.type() == Json::Type::Object) return j;
+  static thread_local Json parsed;  // a miss returns this empty one
+  parsed = Json();
+  if (j.type() != Json::Type::String) return parsed;
+  std::string err;
+  parsed = Json::parse(j.str(), &err);
+  if (!err.empty()) parsed = Json();
+  return parsed;
+}
+
+/** bilibili hands out these image URLs as plain http even though the same path answers over https
+ *  (measured: identical 15906-byte PNG both ways, see docs/internals.md). Fetching them as
+ *  advertised would put every picture on the wire in cleartext and would break outright behind any
+ *  network that filters port 80, which then looks exactly like "the picture never arrived". */
+std::string httpsUrl(const std::string& url) {
+  constexpr const char* kPlain = "http://";
+  if (url.compare(0, strlen(kPlain), kPlain) != 0) return url;
+  return "https://" + url.substr(strlen(kPlain));
+}
+
+}  // namespace
+
 void Bili::splitFragments(const std::string& text,
                            const std::vector<std::pair<std::string, Fragment>>& emotes,
                            std::vector<Fragment>& out) {
@@ -518,24 +549,45 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     out.user = ia.at(2).at(1).str();
     const std::string text = ia.at(1).str();
 
-    // The emote tokens this particular message used, and where their images live.
-    std::vector<std::pair<std::string, Fragment>> emotes;
-    const std::string extra = tail["extra"].str();
-    if (!extra.empty()) {
-      std::string err;
-      const Json ex = Json::parse(extra, &err);
-      if (err.empty()) {
-        for (const auto& kv : ex["emots"].items()) {
-          Fragment f;
-          f.kind = Fragment::Kind::Emote;
-          f.text = kv.first;
-          f.url = kv.second["url"].str();
-          f.px = static_cast<int>(kv.second["height"].num());
-          emotes.emplace_back(kv.first, std::move(f));
+    // info[0][12] is dm_type: 0 text, 1 emote, 2 voice. An emote danmaku -- an official little
+    // face or one of the streamer's own uploaded ones -- is the whole body being one picture:
+    // extra.emots is null in that case and there is no token to look up, so reading only that map
+    // drew every emote as its name spelled out. Measured in room 545068:
+    //   info[1]         "嘻嘻"                     (the name, no brackets)
+    //   info[0][13]     {"emoticon_unique":"room_545068_9780","url":"http://i0.hdslb.com/...",
+    //                    "width":162,"height":162,"in_player_area":1,"bulge_display":1,...}
+    // The official ones carry "official_<n>" in emoticon_unique instead of "room_<id>_<n>"; the
+    // picture is in the same field either way.
+    const int64_t dmType = head.at(12).num();
+    if (dmType == 1) {
+      const Json& opts = objectOrJson(head.at(13));
+      Fragment f;
+      f.kind = Fragment::Kind::Emote;
+      f.text = text;  // what the sender picked; drawn as text if the picture never arrives
+      f.url = httpsUrl(opts["url"].str());
+      f.px = static_cast<int>(opts["height"].num());
+      out.parts.push_back(std::move(f));
+    } else {
+      // A text body may still carry emotes inline: the platform then names them in extra.emots,
+      // keyed by the literal bracketed token that appears in the text.
+      std::vector<std::pair<std::string, Fragment>> emotes;
+      const std::string extra = tail["extra"].str();
+      if (!extra.empty()) {
+        std::string err;
+        const Json ex = Json::parse(extra, &err);
+        if (err.empty()) {
+          for (const auto& kv : ex["emots"].items()) {
+            Fragment f;
+            f.kind = Fragment::Kind::Emote;
+            f.text = kv.first;
+            f.url = httpsUrl(kv.second["url"].str());
+            f.px = static_cast<int>(kv.second["height"].num());
+            emotes.emplace_back(kv.first, std::move(f));
+          }
         }
       }
+      splitFragments(text, emotes, out.parts);
     }
-    splitFragments(text, emotes, out.parts);
 
     // The user object is what carries the avatar, the name colour and the guard tier. It is
     // available without a login: only the nickname is masked, not the face.

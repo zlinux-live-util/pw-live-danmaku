@@ -226,25 +226,28 @@ M0 版本的 `parseDanmaku` 写的是 `json["info"].at(9)["extra"]`，也就是�
 
 | 字段 | 路径 | 用途 |
 | --- | --- | --- |
-| 头像 | `info[0][15].user.base.face` | 24px 圆形头像 |
+| 头像 | `info[0][15].user.base.face` | 圆形头像，框高等于正文一行行高（默认字号 28px → 42px） |
 | 昵称 | `info[0][15].user.base.name` | 与 `info[2][1]` 一致 |
 | 昵称颜色 | `info[0][15].user.base.name_color` | 十进制 RGB，0 表示无特殊色 |
 | 上舰 | `info[0][15].user.medal.guard_level` 或 `user.guard.guard_level` | 1 总督 / 2 提督 / 3 舰长 |
-| 表情表 | `info[0][15].extra.emots` | `{ "[token]": {url,width,height} }` |
+| 表情（整条一个表情） | `info[0][12] == 1` 时看 `info[0][13]` | `{emoticon_unique, url, width, height, ...}` |
+| 表情（正文内嵌） | `info[0][15].extra.emots` | `{ "[token]": {url,width,height} }` |
 
-**所以表情图片也是现成的**，不需要自己查表：`extra.emots` 直接给出 token → 图片 URL。
+**所以表情图片也是现成的**，不需要自己查表。两种载体取哪一份，看 `dm_type`（详见[表情弹幕的图片](#表情弹幕的图片)）；只读 `extra.emots` 的版本会在主播自定义表情上只画出名字文字。
 
 仍然拿不到的：**房管 / 主播身份**。这两个身份不在 `DANMU_MSG` 的载荷里，匿名连接无法区分，所以 B 站侧的用户名着色实际只有「普通」和「舰长」两档。这两个槽位留给 Twitch（`badges` tag 有 moderator/subscriber/broadcaster）。
 
 ## 表情弹幕的正文是字面量 token
 
-`extra.emots` 的键就是正文里出现的那段字符串：
+这一节说的是**内嵌**的那种（`dm_type == 0`）：`extra.emots` 的键就是正文里出现的那段字符串：
 
 ```text
 [夏日热浪_想要]   [夏日热浪_爱你]   [夏日热浪_害羞]
 ```
 
 所以切分规则是：**只有平台自己声明过的方括号串才算表情**，其余方括号按普通文本处理。`Bili::splitFragments()` 就是这么做的，单测里有一条专门钉住「未声明的方括号不被吞掉」。
+
+另一种（整条就是一个表情，`dm_type == 1`）根本不走切分：正文就是表情名，图片直接给出来。
 
 ## M1 渲染侧：三个必须遵守的约束
 
@@ -297,7 +300,7 @@ per frame     : 1.000 ms
 private memory: 94 MB
 ```
 
-数字里包含：静态层整块拷贝（480×1080×4 ≈ 2.1 MB/帧）、每帧重画的 36 个 24px 头像圆盘、以及 b站协议解码。消费者断开时帧回调一次不被调用，渲染开销为零。
+数字里包含：静态层整块拷贝（480×1080×4 ≈ 2.1 MB/帧）、每帧重画的 36 个头像圆盘（框高等于一行行高）、以及 b站协议解码。消费者断开时帧回调一次不被调用，渲染开销为零。
 
 早期版本在 480×900 下曾量到「0 tick」，那是**采样错误**（读到了错误的进程或时刻），不是真实开销；上面这个用精确窗口 + 帧数差值重测过。
 
@@ -337,7 +340,7 @@ cairo 把源图像锚定在**左上角**，所以 24px 的圆裁到的正是那�
 
 这个 bug 的迷惑性在于**所有计数都正常**：`fetched=48 failed=0`、空 `face` 字段 0 个。图确实到了，只是到的时候没有人重画。
 
-现在头像不烘焙，每帧从行的几何位置画（几十个 24px 小圆，开销可忽略）。迟到的图**下一帧自然就在**，不需要任何重绘机制。
+现在头像不烘焙，每帧从行的几何位置画（几十个小圆，开销可忽略）。迟到的图**下一帧自然就在**，不需要任何重绘机制。
 
 ### 三、动画行被画了两次
 
@@ -367,7 +370,53 @@ const double screenTop = height_ - (contentH_ - bottom);   // ← 多了 r.h
 
 ## 表情弹幕的图片
 
-`extra.emots` 直接给出 `{ "[token]": {url,width,height} }`，所以图片不需要自己查表。
+**表情分两种载体，两种都要接，否则只会看到文字。**
+
+| 形式 | 触发条件 | 正文 | 图片位置 |
+| --- | --- | --- | --- |
+| 整条就是一个表情 | `info[0][12] == 1`（`dm_type`） | 表情名，**不带方括号** | `info[0][13].url` |
+| 正文里内嵌表情 | `dm_type == 0` 且 `extra.emots != null` | 混排文本 | `extra.emots["[token]"].url` |
+
+主播自定义表情（主播自己上传的那套）走的是**第一种**。实测抓包（房间 545068，2026-10-04）：
+
+```text
+cmd        DANMU_MSG
+info[1]    嘻嘻                  ← 表情名，没有方括号
+info[0][12]  1                ← dm_type：0 文本，1 表情，2 语音
+info[0][13]  {"bulge_display":1,"emoticon_unique":"room_545068_9780","height":162,
+              "in_player_area":1,"is_dynamic":0,
+              "url":"http://i0.hdslb.com/bfs/live/46ec99....png","width":162}
+info[0][14]  {}                ← voice_config
+info[0][15].extra  {...,"dm_type":1,"emoticon_unique":"room_545068_9780","emots":null,...}
+```
+
+**同一种载体里，正文有两种写法**，这是最容易看漏的地方：
+
+| `emoticon_unique` | 正文 | 例子（实测） |
+| --- | --- | --- |
+| `room_<房间号>_<id>` | 裸表情名 | `room_545068_9780` → `嘻嘻`；`room_1852504554_97350` → `Evil挥手` |
+| `upower_[token]` | **带方括号** | `upower_[Neuro sama收藏集_晚安]` → `[Neuro sama收藏集_晚安]`；`upower_[水豚噜噜_吃瓜]` → `[水豚噜噜_吃瓜]` |
+
+也就是说：**方括号不代表它是内联 token**。看到正文是 `[xxx]` 就去查 `extra.emots`，在收藏集 / 表情包表情上必然查不到（`emots` 是 `null`），然后就把 token 当文字画了出来。判据只有 `dm_type`。
+
+几个要点：
+
+1. **`extra.emots` 在这种消息里是 `null`。** 只读 `extra.emots` 的版本会把每个表情画成名字文字——症状是「只显示 token」，而且看上去完全像渲染出了问题。
+2. `info[0][13]` 可能是嵌套对象，也可能是 **JSON 字符串**（同一条消息里的 `info[0][14]` 就是字符串 `"{}"`），两种写法都得读。
+3. 这个 `url` 有时是 **`http://`** 而不是 https（`/bfs/live/` 上实测过；`/bfs/garb/` 上是 https）。同一个路径用 https 访问实测返回同一张图（均为 162×162 PNG，15906 字节），所以下载前统一改成 https：照原样取会在过滤 80 端口的网络里彻底失败，而那个症状和「图没下载到」一模一样。
+
+对照参考：[blivechat](https://github.com/xfgryujk/blivechat) → [blivedm `models/web.py`](https://github.com/xfgryujk/blivedm)：`info[0][12]` = `dm_type`，`info[0][13]` = `emoticon_options`，`blivechat` 在 `dm_type == 1` 时把整条当成图片消息（`ContentType.EMOTICON`）——上面三种 `emoticon_unique` 写法它一视同仁。
+
+`extra.emots` 直接给出 `{ "[token]": {url,width,height} }`，所以内嵌表情的图片也不需要自己查表。同一房间的实测样本：
+
+```text
+info[1]    喵锅[委屈]忍耐啊！！[委屈]        ← dm_type=0，一条里两个内嵌表情
+extra.emots  {"[委屈]":{"count":1,"descript":"[委屈]","emoji":"[委屈]",
+                        "emoticon_id":218,"emoticon_unique":"emoji_218","height":20,
+                        "url":"http://i0.hdslb.com/bfs/live/....png","width":20}}
+```
+
+`emoticon_unique` 的前缀目前观察到四种：`emoji_<id>`（内嵌的官方小表情）、`room_<房间号>_<id>`（主播自定义）、`upower_[token]`（收藏集 / 表情包表情）、`official_<id>`（整条一个表情的官方表情，来自 blivedm 文档，本机未抓到）。**前缀不重要，重要的是判据 `dm_type` 与图片所在的字段**。
 
 排版做法：**先把每个表情替换成一个对象替换字符 U+FFFC，交给 pango 排版**，再把每个视觉行在 U+FFFC 处切开，交替绘制文本段和图片。这样**换行由 pango 决定**，表情落点由 pango 的排版结果决定；如果自己按 fragment 手工断行，就得重新实现一遍中英文混排的断行点，那才是难的部分。
 
@@ -380,7 +429,7 @@ U+FFFC 本身不会被画出来。图片没到时把 token 按字面文本画在
 - `SUPER_CHAT_MESSAGE` / `GUARD_BUY` 的真实载荷（本机这几个房间都太安静）。
 - 顶部 / 底部 / 逆向 / 高级弹幕的 `mode` 取值语义。对叠加层来说**这很可能不重要**：面板本来就把它们当普通文本行渲染，`mode` 只影响弹幕在视频上的位置，不影响聊天气泡。
 - 弹幕洪峰。本机样本房间 30 秒最多 29 条；热门房间会到每秒数十条。已有界队列（`kPendingCap=400`）与每帧上限（`kMaxPerFrame=40`）兜底，但丢弃策略尚未在高流量下验证。
-- 表情**图片**已经接上（`extra.emots` 的 URL + 独立的 `ImageStore` + U+FFFC 内联排版），但**只在实机验证过**：本机房间的表情频率不够高，`--dump` 一次不一定能抓到带表情的消息。
+- 语音弹幕（`dm_type == 2`，`info[0][14].voice_config`）：未处理，正文会当作普通文字画出来。
 - Twitch：IRC 正在退役（见评估），EventSub 需要用户自带 token。
 
 ## 调试方法

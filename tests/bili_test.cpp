@@ -236,6 +236,118 @@ void testParseDanmakuEmote() {
   checkEq(m.plainText(), "白花300块[夏日热浪_想要]", "emote danmaku: plain text round-trips");
 }
 
+// A streamer's own uploaded emote (主播自定义表情). Measured on the wire in room 545068, cut down to
+// the fields this reads: info[0][12] is 1, info[0][13] carries the picture, and extra.emots -- the
+// map the inline-token case uses -- is null. The body is the emote's name, without brackets.
+void testParseDanmakuStreamerEmote() {
+  const std::string body = R"J({"cmd":"DANMU_MSG","info":[
+   [0,1,25,16777215,1791065364000,1,0,"h",0,0,0,"",
+    1,
+    {"bulge_display":1,"emoticon_unique":"room_545068_9780","height":162,"in_player_area":1,
+     "is_dynamic":0,"url":"http://i0.hdslb.com/bfs/live/46ec99d09a2b8c84314f0c506a55660ee08a9069.png",
+     "width":162},
+    {},
+    {"extra":"{\"mode\":0,\"dm_type\":1,\"emoticon_unique\":\"room_545068_9780\",\"emots\":null}",
+     "user":{"base":{"name":"钱少奢侈硬享受","face":"https://i1.hdslb.com/bfs/face/a.jpg"}}}],
+   "嘻嘻",
+   [0,"钱少奢侈硬享受",0,0,0,10000,1,""],
+   [10,0,0,0,"{}",0],["",""],0,0,0,0,
+   {"ct":"x","ts":1},0,0,null,null,0,1,[1],null]})J";
+
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "streamer emote: recognised");
+  checkEqInt(m.parts.size(), size_t(1), "streamer emote: the whole body is the picture");
+  if (m.parts.size() == 1) {
+    checkEqInt(static_cast<int>(m.parts[0].kind), static_cast<int>(Fragment::Kind::Emote),
+              "streamer emote: one emote fragment");
+    checkEq(m.parts[0].url,
+            "https://i0.hdslb.com/bfs/live/46ec99d09a2b8c84314f0c506a55660ee08a9069.png",
+            "streamer emote: url from info[0][13], upgraded to https");
+    checkEq(m.parts[0].text, "嘻嘻", "streamer emote: name kept as the text fallback");
+    checkEqInt(m.parts[0].px, 162, "streamer emote: advertised size");
+  }
+  checkEq(m.plainText(), "嘻嘻", "streamer emote: plain text round-trips");
+}
+
+// The same emote with info[0][13] as a JSON string instead of a nested object, which is how some
+// payloads spell it (info[0][14] in the fixture above is an object where the wire had "{}").
+void testParseDanmakuEmoteOptionsAsString() {
+  const std::string body = R"J({"cmd":"DANMU_MSG","info":[
+   [0,1,25,16777215,1,1,0,"h",0,0,0,"",1,
+    "{\"emoticon_unique\":\"official_13\",\"height\":60,\"width\":183,\"url\":\"https://i0.hdslb.com/bfs/live/a98e359.png\"}",
+    "{}",
+    {"extra":"{\"mode\":0,\"dm_type\":1,\"emots\":null}","user":{"base":{"name":"u","face":""}}}],
+   "妙啊",
+   [0,"u",0,0,0,10000,1,""],
+   [10,0,0,0,"{}",0],["",""],0,0,0,0,
+   {"ct":"x","ts":1},0,0,null,null,0,1,[1],null]})J";
+
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "emote options as string: recognised");
+  checkEqInt(m.parts.size(), size_t(1), "emote options as string: one emote fragment");
+  if (m.parts.size() == 1) {
+    checkEq(m.parts[0].url, "https://i0.hdslb.com/bfs/live/a98e359.png",
+            "emote options as string: url read out of the string");
+    checkEqInt(m.parts[0].px, 60, "emote options as string: advertised size");
+  }
+}
+
+// A dm_type of 0 with no advertised emote must not be mistaken for one: the whole point of reading
+// info[0][12] rather than trusting the body's shape.
+void testParseDanmakuTextWithBrackets() {
+  const std::string body = R"J({"cmd":"DANMU_MSG","info":[
+   [0,1,25,16777215,1,1,0,"h",0,0,0,"",0,"{}","{}",
+    {"extra":"{\"mode\":0,\"dm_type\":0,\"emots\":null}","user":{"base":{"name":"u","face":""}}}],
+   "[嘻嘻]",
+   [0,"u",0,0,0,10000,1,""],
+   [10,0,0,0,"{}",0],["",""],0,0,0,0,
+   {"ct":"x","ts":1},0,0,null,null,0,1,[1],null]})J";
+
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "brackets without dm_type: recognised");
+  checkEqInt(m.parts.size(), size_t(1), "brackets without dm_type: one text run");
+  if (m.parts.size() == 1) {
+    checkEqInt(static_cast<int>(m.parts[0].kind), static_cast<int>(Fragment::Kind::Text),
+              "brackets without dm_type: stays text");
+    checkEq(m.parts[0].text, "[嘻嘻]", "brackets without dm_type: brackets are literal");
+  }
+}
+
+// A 收藏集 / 表情包 emote: same carrier as the streamer's own, but the body keeps its brackets and
+// emoticon_unique is the literal string "upower_[token]". Measured in room 1921271623, whose chat is
+// full of these; the token reported in the bug this fixed was "[Neuro sama收藏集_晚安]".
+void testParseDanmakuBracketedEmoteToken() {
+  const std::string body = R"J({"cmd":"DANMU_MSG","info":[
+   [0,1,25,16777215,1791070000000,1,0,"h",0,0,0,"",1,
+    {"bulge_display":1,"emoticon_unique":"upower_[Neuro sama收藏集_晚安]","height":20,
+     "in_player_area":1,"is_dynamic":0,
+     "url":"https://i0.hdslb.com/bfs/garb/bf7dc14be1fe85256bb2b7237802a29d443b5664.png",
+     "width":20},
+    {},
+    {"extra":"{\"mode\":0,\"dm_type\":1,\"emoticon_unique\":\"upower_[Neuro sama收藏集_晚安]\",\"emots\":null}",
+     "user":{"base":{"name":"帕金尼","face":"https://i1.hdslb.com/bfs/face/a.jpg"}}}],
+   "[Neuro sama收藏集_晚安]",
+   [0,"帕金尼",0,0,0,10000,1,""],
+   [10,0,0,0,"{}",0],["",""],0,0,0,0,
+   {"ct":"x","ts":1},0,0,null,null,0,1,[1],null]})J";
+
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "bracketed emote token: recognised");
+  // One fragment, and it is a picture: the brackets are part of the emote's name, not a token to
+  // look up. Treating them as text is exactly what this used to do.
+  checkEqInt(m.parts.size(), size_t(1), "bracketed emote token: the whole body is the picture");
+  if (m.parts.size() == 1) {
+    checkEqInt(static_cast<int>(m.parts[0].kind), static_cast<int>(Fragment::Kind::Emote),
+              "bracketed emote token: one emote fragment");
+    checkEq(m.parts[0].url,
+            "https://i0.hdslb.com/bfs/garb/bf7dc14be1fe85256bb2b7237802a29d443b5664.png",
+            "bracketed emote token: url from info[0][13]");
+    checkEqInt(m.parts[0].px, 20, "bracketed emote token: advertised size");
+  }
+  // The name is kept so the row still reads if the picture never arrives.
+  checkEq(m.plainText(), "[Neuro sama收藏集_晚安]", "bracketed emote token: plain text round-trips");
+}
+
 // The two card kinds follow the documented field tables but have not been observed on this
 // machine, so these tests pin the mapping rather than a capture.
 void testParsePaidCard() {
@@ -320,6 +432,10 @@ int main() {
   testForEachJsonStopsEarly();
   testParseDanmaku();
   testParseDanmakuEmote();
+  testParseDanmakuStreamerEmote();
+  testParseDanmakuBracketedEmoteToken();
+  testParseDanmakuEmoteOptionsAsString();
+  testParseDanmakuTextWithBrackets();
   testSplitFragments();
   testParsePaidCard();
   testParseMembershipCard();
