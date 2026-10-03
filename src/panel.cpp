@@ -115,7 +115,7 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   return std::max(body, tok_.avatar) + tok_.rowGap;
 }
 
-void Panel::drawAvatar(cairo_t* cr, const Message& m, double cx, double cy, double d) const {
+void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy, double d) const {
   const double r = d / 2.0;
   cairo_save(cr);
   // Circular clip, so a square avatar is trimmed to a disc. Set before the transform below, so it
@@ -124,7 +124,7 @@ void Panel::drawAvatar(cairo_t* cr, const Message& m, double cx, double cy, doub
   cairo_clip(cr);
 
   pwvideo::SurfacePtr surf;
-  if (avatars_) surf = avatars_->lookup(m.avatarUrl);
+  if (avatars_) surf = avatars_->lookup(url);
   if (surf) {
     // Scale the picture into the box instead of assuming it is already the right size. cairo
     // anchors a source surface at its top-left corner, so a surface larger than the box would be
@@ -140,12 +140,27 @@ void Panel::drawAvatar(cairo_t* cr, const Message& m, double cx, double cy, doub
       cairo_set_source_rgba(cr, 0.55, 0.58, 0.62, 1.0);
     }
   } else {
-    // Placeholder disc. Bilibili hands out face URLs without a login, so a miss is normally
-    // "not fetched yet" rather than "not available".
+    // Placeholder disc. Because avatars are drawn live rather than baked, this is genuinely
+    // transient: the next frame after the picture lands shows the picture. It is still worth
+    // distinguishing, since the site default avatar is itself a flat grey figure.
     cairo_set_source_rgba(cr, 0.55, 0.58, 0.62, 1.0);
   }
   cairo_paint(cr);
   cairo_restore(cr);
+}
+
+void Panel::drawAvatars(cairo_t* cr) const {
+  // Rows are positioned from their content-space geometry rather than tracked incrementally, so
+  // this stays correct however many times the list has been shifted.
+  const double top = contentH_ - static_cast<double>(height_);
+  const double cx = tok_.padX + tok_.avatar / 2.0;
+  for (const Row& r : rows_) {
+    if (r.card || r.avatarUrl.empty()) continue;
+    const double bottom = r.y + r.h;
+    if (bottom <= top) continue;  // scrolled out of view
+    const double screenTop = static_cast<double>(height_) - (contentH_ - bottom);
+    drawAvatar(cr, r.avatarUrl, cx, screenTop + tok_.avatar / 2.0, tok_.avatar);
+  }
 }
 
 double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const {
@@ -188,14 +203,16 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     return ly - y;
   }
 
-  // Plain line: the role-coloured bar at the far left, then the avatar, then "name: body".
+  // Plain line: the role-coloured bar at the far left, then a gap for the avatar, then "name: body".
   const pwvideo::Rgba bar = rgb(barColor(m.type), m.type == UserType::Normal ? 0.5 : 1.0);
   cairo_set_source_rgba(cr, bar.r, bar.g, bar.b, bar.a);
   pwvideo::roundedRect(cr, x + tok_.barX, y + tok_.barInset, tok_.barWidth,
                        tok_.avatar - tok_.barInset * 2.0, 1.0);
   cairo_fill(cr);
 
-  drawAvatar(cr, m, x + tok_.padX + tok_.avatar / 2.0, y + tok_.avatar / 2.0, tok_.avatar);
+  // The avatar is not drawn here. It is painted per frame by drawAvatars(), so that a face which
+  // arrives after this row has been laid out still appears; baking it here would freeze whatever
+  // was in the cache at that instant, which is usually the placeholder disc.
 
   const double textX = x + tok_.padX + tok_.avatar + tok_.avatarGap;
   const double avail = w - textX - tok_.padRight;
@@ -297,7 +314,7 @@ void Panel::rebuildLayer(const std::vector<Message>& msgs) {
   double y = static_cast<double>(height_) - total;
   for (size_t i = 0; i < msgs.size(); ++i) {
     paintRow(lc, msgs[i], 0.0, y, static_cast<double>(width_));
-    rows_.push_back(Row{count_++, contentH_, hs[i], msgs[i].kind != MsgKind::Text});
+    rows_.push_back(Row{count_++, contentH_, hs[i], msgs[i].kind != MsgKind::Text, msgs[i].avatarUrl});
     contentH_ += hs[i];
     y += hs[i];
   }
@@ -335,7 +352,7 @@ bool Panel::update(const std::vector<Message>& fresh, int64_t nowMs) {
     bool card = false;
     const double h = measureRow(fresh[i], lc, &card);
     shiftAndPaint(fresh[i], h);
-    rows_.push_back(Row{count_++, contentH_, h, card});
+    rows_.push_back(Row{count_++, contentH_, h, card, fresh[i].avatarUrl});
     contentH_ += h;
   }
 
@@ -346,7 +363,7 @@ bool Panel::update(const std::vector<Message>& fresh, int64_t nowMs) {
   bool card = false;
   const double h = measureRow(last, lc, &card);
   reserveBand(h);
-  rows_.push_back(Row{count_++, contentH_, h, card});
+  rows_.push_back(Row{count_++, contentH_, h, card, last.avatarUrl});
   contentH_ += h;
   anim_ = last;
   animRowH_ = h;
@@ -368,6 +385,11 @@ void Panel::render(cairo_t* cr, int64_t nowMs) {
   cairo_paint(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
+  // Avatars for every settled row, painted live rather than baked into the layer. They are small
+  // (a 24 px disc, a few dozen of them) and this is what makes a face that arrives late still show
+  // up: nothing has to be repainted, it is simply there on the next frame.
+  drawAvatars(cr);
+
   if (!animating_) return;
 
   // The fading row goes into a group so its opacity applies to the row as a whole, outline
@@ -377,6 +399,11 @@ void Panel::render(cairo_t* cr, int64_t nowMs) {
   cairo_translate(cr, tok_.animShift * (1.0 - t), 0.0);
   cairo_push_group(cr);
   paintRow(cr, anim_, 0.0, height_ - animRowH_, static_cast<double>(width_));
+  // Its own avatar goes inside the group too, so it slides and fades with the row instead of
+  // standing still while the text beside it moves.
+  if (!anim_.avatarUrl.empty())
+    drawAvatar(cr, anim_.avatarUrl, tok_.padX + tok_.avatar / 2.0,
+               height_ - animRowH_ + tok_.avatar / 2.0, tok_.avatar);
   cairo_pop_group_to_source(cr);
   cairo_paint_with_alpha(cr, t);
   cairo_restore(cr);

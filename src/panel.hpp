@@ -79,12 +79,18 @@ struct PanelTokens {
   std::string font;
 };
 
-/** Geometry of one laid-out message, in content space. */
+/** Geometry of one laid-out message, in content space.
+ *
+ *  avatarUrl is carried here rather than baked into the picture because avatars are drawn every
+ *  frame instead. The reason is correctness, not cost: a face that arrives after its row has been
+ *  laid out would otherwise stay a placeholder disc forever, because nothing ever repaints a
+ *  settled row. Drawing the little discs live means a late arrival shows up on the next frame. */
 struct Row {
-  size_t index = 0;   // index into the MessageList
+  size_t index = 0;   // running total, for identity only
   double y = 0.0;     // top edge, in content space measured from the top of the content
   double h = 0.0;     // full height including the gap below
   bool card = false;
+  std::string avatarUrl;
 };
 
 class Panel {
@@ -138,7 +144,10 @@ class Panel {
   void bakeAnimating();
   /** Drops rows that have scrolled out of the panel, so the vector cannot grow without bound. */
   void prune();
-  void drawAvatar(cairo_t* cr, const Message& m, double cx, double cy, double d) const;
+  void drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy, double d) const;
+  /** Paints the avatars for every row currently on screen. Separate from paintRow so that a face
+   *  arriving after its row was laid out appears without the row having to be redrawn. */
+  void drawAvatars(cairo_t* cr) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;
