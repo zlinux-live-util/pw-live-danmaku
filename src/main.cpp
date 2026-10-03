@@ -170,6 +170,21 @@ struct Shared {
   std::string lastEvent;
   std::deque<Message> pending;
   uint64_t total = 0, dropped = 0;
+  // Why a message is showing the placeholder disc. The fetch counters cannot answer this: a user
+  // with no face URL is never requested, so it looks identical to a face that has not arrived yet.
+  uint64_t avatarEmpty = 0, avatarHttps = 0, avatarHttp = 0, avatarProtoRel = 0, avatarOther = 0;
+
+  /** Classifies an avatar URL by shape. The protocol-relative case matters: a bare "//host/path"
+   *  is not a URL the HTTP client will accept, and it would fail in a way that looks like a network
+   *  problem rather than a malformed field. */
+  void noteAvatar(const std::string& url) {
+    std::lock_guard<std::mutex> lk(mu);
+    if (url.empty()) ++avatarEmpty;
+    else if (url.rfind("https://", 0) == 0) ++avatarHttps;
+    else if (url.rfind("http://", 0) == 0) ++avatarHttp;
+    else if (url.rfind("//", 0) == 0) ++avatarProtoRel;
+    else ++avatarOther;
+  }
 
   void append(Message m) {
     std::lock_guard<std::mutex> lk(mu);
@@ -303,7 +318,16 @@ void siteLoop(Shared& sh, Bili& bili, AvatarStore& avatars, const std::string& r
           return true;
         }
         // Face images are fetched by the avatar thread; this only records the wish.
-        if (!m.avatarUrl.empty()) avatars.request(m.avatarUrl);
+        sh.noteAvatar(m.avatarUrl);
+        if (!m.avatarUrl.empty()) {
+          // A URL we already have means two users share one picture. When that picture is the
+          // site's default, several different people appear with the same flat disc, which reads
+          // as a rendering fault and is not one.
+          if (verbose && avatars.isCached(m.avatarUrl))
+            std::fprintf(stderr, "[avatar] shared pic: %s  (user %s)\n", m.avatarUrl.c_str(),
+                         m.user.c_str());
+          avatars.request(m.avatarUrl);
+        }
         if (verbose)
           std::fprintf(stderr, "[msg] %s%s: %s\n",
                        m.kind == MsgKind::Text ? "" : (m.kind == MsgKind::Paid ? "[paid] " : "[sub] "),
@@ -551,11 +575,18 @@ int main(int argc, char** argv) {
               std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (stop.load()) break;
             const std::string err = avatars.lastError();
-            std::fprintf(stderr, "[avatar] cached=%zu pending=%zu fetched=%llu failed=%llu%s%s\n",
+            std::fprintf(stderr,
+                         "[avatar] cached=%zu pending=%zu fetched=%llu failed=%llu%s%s\n"
+                         "[avatar] url shapes: empty=%llu https=%llu http=%llu proto-rel=%llu other=%llu\n",
                          avatars.cached(), avatars.pending(),
                          static_cast<unsigned long long>(avatars.fetched()),
                          static_cast<unsigned long long>(avatars.failed()),
-                         err.empty() ? "" : "  last-fail: ", err.c_str());
+                         err.empty() ? "" : "  last-fail: ", err.c_str(),
+                         static_cast<unsigned long long>(sh.avatarEmpty),
+                         static_cast<unsigned long long>(sh.avatarHttps),
+                         static_cast<unsigned long long>(sh.avatarHttp),
+                         static_cast<unsigned long long>(sh.avatarProtoRel),
+                         static_cast<unsigned long long>(sh.avatarOther));
           }
         });
       }

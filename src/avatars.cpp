@@ -46,6 +46,12 @@ pwvideo::SurfacePtr AvatarStore::lookup(const std::string& url) const {
   return it->second.surf;
 }
 
+bool AvatarStore::isCached(const std::string& url) const {
+  if (url.empty()) return false;
+  std::lock_guard<std::mutex> lk(mu_);
+  return cache_.count(url) != 0;
+}
+
 size_t AvatarStore::cached() const {
   std::lock_guard<std::mutex> lk(mu_);
   return cache_.size();

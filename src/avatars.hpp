@@ -40,6 +40,11 @@ class AvatarStore {
    *  touches the network. This is the only call the render path makes. */
   pwvideo::SurfacePtr lookup(const std::string& url) const;
 
+  /** Whether the URL is already decoded and cached. Used only for diagnostics: a user with no
+   *  picture and a user sharing the site default avatar look identical on screen, and the fetch
+   *  counters cannot tell them apart because neither of them is a fetch. */
+  bool isCached(const std::string& url) const;
+
   /** Resolves blocking get() calls until stop() is called or the queue empties. */
   void runWorker();
   void stop();
