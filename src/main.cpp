@@ -22,7 +22,7 @@
 
 #include <cairo/cairo.h>
 
-#include "avatars.hpp"
+#include "images.hpp"
 #include "bili.hpp"
 #include "cairo_util.hpp"
 #include "message.hpp"
@@ -216,7 +216,8 @@ void drain(Shared& sh, std::vector<Message>& out) {
   }
 }
 
-void siteLoop(Shared& sh, Bili& bili, AvatarStore& avatars, const std::string& roomInput,
+void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImages,
+              const std::string& roomInput,
               bool verbose, std::atomic<bool>& stop, pwvideo::VideoNode* video,
               std::atomic<int>& received, int count) {
   try {
@@ -327,6 +328,13 @@ void siteLoop(Shared& sh, Bili& bili, AvatarStore& avatars, const std::string& r
             std::fprintf(stderr, "[avatar] shared pic: %s  (user %s)\n", m.avatarUrl.c_str(),
                          m.user.c_str());
           avatars.request(m.avatarUrl);
+        // Emotes are fetched from the platform's own CDN URLs in extra.emots. They go in a separate
+        // store because they are reused all evening by everyone, unlike faces which are one per
+        // viewer, so they deserve their own cache budget and a bigger share of it.
+        for (const Fragment& part : m.parts) {
+          if (part.kind == Fragment::Kind::Emote && !part.url.empty())
+            emoteImages.request(part.url);
+        }
         }
         if (verbose)
           std::fprintf(stderr, "[msg] %s%s: %s\n",
@@ -466,9 +474,13 @@ int main(int argc, char** argv) {
   // 48 px decoded into a 24 px box, so the face stays crisp on a hidpi canvas without storing four
   // times the pixels it needs. The capacity is separate and only bounds memory: a busy room shows
   // roughly 36 rows, and a visible row's avatar has to outlive the messages that push it off.
-  AvatarStore avatars(48, 256, bili.userAgent());
+  ImageStore avatars(48, 256, bili.userAgent());
+  // Emotes are a small closed set reused by everyone, so they are worth far more entries than a
+  // face is; 48 px is enough at the 24 px box they are drawn into.
+  ImageStore emoteImages(48, 512, bili.userAgent());
   Panel panel(tokens);
-  panel.setAvatarStore(&avatars);
+  panel.setImageStore(&avatars);
+  panel.setEmoteStore(&emoteImages);
   panel.resize(o.width, o.height);
   pwvideo::CairoFrame frame(o.width, o.height);
 
@@ -543,11 +555,13 @@ int main(int argc, char** argv) {
       std::fflush(stdout);
 
       std::thread avatarThread([&avatars] { avatars.runWorker(); });
+      std::thread emoteThread([&emoteImages] { emoteImages.runWorker(); });
 
       std::thread site;
       if (!o.demo) {
-        site = std::thread(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), o.room,
-                           o.verbose, std::ref(stop), &video, std::ref(received), o.count);
+        site = std::thread(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars),
+                           std::ref(emoteImages), o.room, o.verbose, std::ref(stop), &video,
+                           std::ref(received), o.count);
       }
 
       std::thread killer;
@@ -594,7 +608,9 @@ int main(int argc, char** argv) {
       stop.store(true);
       if (site.joinable()) site.join();
       avatars.stop();
+      emoteImages.stop();
       if (avatarThread.joinable()) avatarThread.join();
+      if (emoteThread.joinable()) emoteThread.join();
       if (stats.joinable()) stats.join();
       if (killer.joinable()) killer.join();
       return 0;
@@ -609,9 +625,10 @@ int main(int argc, char** argv) {
   // too, so the dump shows real faces instead of placeholder discs -- which is what makes it useful
   // for judging a layout rather than only for reading the connection state.
   std::thread avatarThread([&avatars] { avatars.runWorker(); });
-  std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), o.room, o.verbose,
-                   std::ref(stop), static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received),
-                   o.count > 0 ? o.count : kDumpMessages);
+  std::thread emoteThread([&emoteImages] { emoteImages.runWorker(); });
+  std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), std::ref(emoteImages),
+                   o.room, o.verbose, std::ref(stop), static_cast<pwvideo::VideoNode*>(nullptr),
+                   std::ref(received), o.count > 0 ? o.count : kDumpMessages);
   const int64_t until = steadyMs() + 90000;
   // Wait for a few messages rather than just the first: one row is not enough to judge a layout,
   // and a panel with real avatars in it needs more than one row to show them.
@@ -624,10 +641,12 @@ int main(int argc, char** argv) {
   // "there is still a backlog", not "nothing has arrived yet" -- the latter returns after the
   // first avatar and leaves the rest as placeholder discs.
   const int64_t avatarUntil = steadyMs() + 8000;
-  while (avatars.pending() > 0 && steadyMs() < avatarUntil)
+  while ((avatars.pending() > 0 || emoteImages.pending() > 0) && steadyMs() < avatarUntil)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   avatars.stop();
+  emoteImages.stop();
   if (avatarThread.joinable()) avatarThread.join();
+  if (emoteThread.joinable()) emoteThread.join();
   // pending() clears when the worker picks a URL up, so allow the last in-flight one to land.
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
   drawOnce(steadyMs());
