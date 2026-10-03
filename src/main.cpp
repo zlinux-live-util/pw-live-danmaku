@@ -336,10 +336,17 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
             emoteImages.request(part.url);
         }
         }
-        if (verbose)
+        if (verbose) {
           std::fprintf(stderr, "[msg] %s%s: %s\n",
                        m.kind == MsgKind::Text ? "" : (m.kind == MsgKind::Paid ? "[paid] " : "[sub] "),
                        m.user.c_str(), m.plainText().c_str());
+          // Emote image URLs, so a layout that looks wrong can be reproduced offline without
+          // having to catch the room mid-emote again.
+          for (const Fragment& part : m.parts) {
+            if (part.kind == Fragment::Kind::Emote && !part.url.empty())
+              std::fprintf(stderr, "[emote] %s -> %s\n", part.text.c_str(), part.url.c_str());
+          }
+        }
         sh.append(std::move(m));
         const int n = received.fetch_add(1) + 1;
         if (count > 0 && n >= count) {
@@ -361,6 +368,33 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
  *  must be rendered as literal text. The last two are the important ones: markup arriving in chat
  *  has to be drawn as glyphs, and cairo plus pango do that by construction because there is no
  *  markup interpretation anywhere in this path. */
+/** Real CDN URLs for a few stock emotes, captured off a live stream. Used by --demo so the emote
+ *  layout can be judged from a dump instead of having to catch a room mid-emote, which is how the
+ *  baseline bug survived several rounds of looking. Only the pictures need the network; everything
+ *  else in the demo is offline, and a missing picture degrades to the token as text. */
+struct DemoEmote {
+  const char* token;
+  const char* url;
+};
+constexpr DemoEmote kDemoEmotes[] = {
+    {"[花]", "http://i0.hdslb.com/bfs/live/7dd2ef03e13998575e4d8a803c6e12909f94e72b.png"},
+    {"[委屈]", "http://i0.hdslb.com/bfs/live/69312e99a00d1db2de34ef2db9220c5686643a3f.png"},
+    {"[笑哭]", "http://i0.hdslb.com/bfs/live/c5436c6806c32b28d471bb23d42f0f8f164a187a.png"},
+    {"[哇]", "http://i0.hdslb.com/bfs/live/650c3e22c06edcbca9756365754d38952fc019c3.png"},
+    {"[汤圆]", "http://i0.hdslb.com/bfs/live/23ae12d3a71b9d7a22c8773343969fcbb94b20d0.png"},
+    {"[藏狐]", "http://i0.hdslb.com/bfs/live/05ef7849e7313e9c32887df922613a7c1ad27f12.png"},
+};
+
+Fragment emotePart(size_t i) {
+  const DemoEmote& e = kDemoEmotes[i % (sizeof(kDemoEmotes) / sizeof(kDemoEmotes[0]))];
+  Fragment f;
+  f.kind = Fragment::Kind::Emote;
+  f.text = e.token;
+  f.url = e.url;
+  f.px = 20;
+  return f;
+}
+
 std::vector<Message> demoMessages() {
   struct Spec {
     const char* user;
@@ -394,13 +428,22 @@ std::vector<Message> demoMessages() {
   paid.kind = MsgKind::Paid;
   paid.user = "五条悟";
   paid.amount = "CN¥30.0";
+  paid.parts.emplace_back(
+      Fragment{Fragment::Kind::Text, "已经没有什么可怕的了", "", 0});
   out.push_back(paid);
 
-  Message paid2;
-  paid2.kind = MsgKind::Paid;
-  paid2.user = "ディオ・ブランドー";
-  paid2.amount = "CN¥50.0";
-  out.push_back(paid2);
+  // A paid message that runs to several lines, which is the common case and the one that used to
+  // be cut off after its first line.
+  Message paidLong;
+  paidLong.kind = MsgKind::Paid;
+  paidLong.user = "ディオ・ブランドー";
+  paidLong.amount = "CN¥50.0";
+  paidLong.parts.emplace_back(Fragment{
+      Fragment::Kind::Text,
+      "主播今天讲的内容值得反复看，顺便问一下下一次直播大概是什么时候开始呀？我带朋友一起过来",
+      "", 0});
+  paidLong.parts.emplace_back(emotePart(2));
+  out.push_back(paidLong);
 
   Message sub;
   sub.kind = MsgKind::Membership;
@@ -412,6 +455,41 @@ std::vector<Message> demoMessages() {
   after.user = "友好的益生菌";
   after.parts.emplace_back(Fragment{Fragment::Kind::Text, "弹幕姬启动", "", 0});
   out.push_back(after);
+
+  // Emote layout cases, the ones that were impossible to reproduce on demand before.
+  Message e1;
+  e1.user = "表情测试";
+  e1.parts.emplace_back(Fragment{Fragment::Kind::Text, "前面有字", "", 0});
+  e1.parts.emplace_back(emotePart(0));
+  e1.parts.emplace_back(Fragment{Fragment::Kind::Text, "后面也有字", "", 0});
+  out.push_back(e1);
+
+  Message e2;
+  e2.user = "开头表情";
+  e2.parts.emplace_back(emotePart(1));
+  e2.parts.emplace_back(Fragment{Fragment::Kind::Text, "紧跟一段文字", "", 0});
+  out.push_back(e2);
+
+  Message e3;  // a line that is nothing but an emote
+  e3.user = "纯表情";
+  e3.parts.emplace_back(emotePart(3));
+  out.push_back(e3);
+
+  Message e4;  // long enough that the emote lands on a wrapped line
+  e4.user = "换行表情";
+  e4.parts.emplace_back(Fragment{
+      Fragment::Kind::Text,
+      "这一段文字特别长，长到需要折行，于是后面的表情会被挤到第二行上去", "", 0});
+  e4.parts.emplace_back(emotePart(4));
+  e4.parts.emplace_back(Fragment{Fragment::Kind::Text, "尾巴", "", 0});
+  out.push_back(e4);
+
+  Message e5;  // two emotes in a row, to see the gap between them
+  e5.user = "连续表情";
+  e5.parts.emplace_back(emotePart(5));
+  e5.parts.emplace_back(emotePart(2));
+  e5.parts.emplace_back(emotePart(0));
+  out.push_back(e5);
   return out;
 }
 
@@ -506,8 +584,27 @@ int main(int argc, char** argv) {
 
   if (o.demo) {
     // Everything is known up front, so paint the list in one go rather than row by row.
-    sh.setState("demo (no network)");
-    panel.rebuildLayer(demoMessages());
+    sh.setState("demo");
+    const std::vector<Message> msgs = demoMessages();
+    panel.rebuildLayer(msgs);
+
+    // Only the emote pictures need the network here, and only because their URLs are the site's
+    // own CDN ones rather than something checked in. Everything else -- every message, both card
+    // kinds, all the text -- is offline, and a picture that will not download degrades to its
+    // token as text rather than breaking the layout.
+    std::thread emoteThread([&emoteImages] { emoteImages.runWorker(); });
+    for (const Message& m : msgs) {
+      for (const Fragment& part : m.parts) {
+        if (part.kind == Fragment::Kind::Emote && !part.url.empty()) emoteImages.request(part.url);
+      }
+    }
+    const int64_t emoteUntil = steadyMs() + 8000;
+    while (emoteImages.pending() > 0 && steadyMs() < emoteUntil)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    emoteImages.stop();
+    if (emoteThread.joinable()) emoteThread.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // let the last one land
+
     if (!o.dump.empty()) {
       panel.render(frame.cr(), steadyMs());
       settleForDump();
@@ -515,7 +612,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "PNG write failed: %s\n", o.dump.c_str());
         return 1;
       }
-      std::printf("Wrote %s (%dx%d)\n", o.dump.c_str(), o.width, o.height);
+      std::printf("Wrote %s (%dx%d), %zu emotes cached, %llu failed\n", o.dump.c_str(), o.width,
+                  o.height, emoteImages.cached(),
+                  static_cast<unsigned long long>(emoteImages.failed()));
       return 0;
     }
   }
