@@ -152,13 +152,25 @@ void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy
 void Panel::drawAvatars(cairo_t* cr) const {
   // Rows are positioned from their content-space geometry rather than tracked incrementally, so
   // this stays correct however many times the list has been shifted.
+  //
+  // The row that is currently animating is deliberately skipped: update() pushes it onto rows_ like
+  // any other, but render() draws its avatar inside the sliding group so the picture moves with the
+  // text. Drawing it here as well would paint it a second time at the untranslated position, so the
+  // avatar would sit still while the line beside it slid in.
   const double top = contentH_ - static_cast<double>(height_);
   const double cx = tok_.padX + tok_.avatar / 2.0;
-  for (const Row& r : rows_) {
+  const size_t skipTail = animating_ && !rows_.empty() ? 1 : 0;
+  const size_t n = rows_.size() - skipTail;
+  for (size_t i = 0; i < n; ++i) {
+    const Row& r = rows_[i];
     if (r.card || r.avatarUrl.empty()) continue;
-    const double bottom = r.y + r.h;
-    if (bottom <= top) continue;  // scrolled out of view
-    const double screenTop = static_cast<double>(height_) - (contentH_ - bottom);
+    if (r.y + r.h <= top) continue;  // scrolled out of view
+    // The visible window is the last height_ pixels of the content, so a row's top in content
+    // space maps to the screen by subtracting where the window starts. This has to use r.y, not the
+    // row's bottom: using the bottom puts every avatar one row-height below the text it belongs to,
+    // while the row being animated is placed from height_ - animRowH_ and is therefore correct --
+    // which is what makes the sliding avatar look like it does not line up with the rest.
+    const double screenTop = static_cast<double>(height_) - (contentH_ - r.y);
     drawAvatar(cr, r.avatarUrl, cx, screenTop + tok_.avatar / 2.0, tok_.avatar);
   }
 }
