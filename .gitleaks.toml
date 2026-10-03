@@ -1,0 +1,21 @@
+# gitleaks configuration
+#
+# The defaults are used unchanged; this file only removes one known false positive, and it is
+# scoped as narrowly as possible so it cannot mask a real secret anywhere else.
+#
+# Note on how gitleaks allowlists match: a `regexes` entry is tested against the *detected secret*,
+# not against the source line. A line-anchored pattern such as "^img_key = ...$" therefore never
+# matches, which is why this file lists the three values explicitly.
+[extend]
+useDefault = true
+
+# These are bilibili's WBI keys. They are not credentials:
+#   * published by the anonymous endpoint https://api.bilibili.com/x/web-interface/nav
+#   * shared by every site-wide request, not tied to any account
+#   * rotated daily by bilibili, so they cannot be "rotated" in response to a disclosure
+# They are documented and unit-tested because the WBI request signature is derived from them, and a
+# regression in that derivation otherwise shows up only as an opaque code:-352 from the API.
+[[allowlists]]
+description = 'Bilibili public, daily-rotating WBI keys used as a signature regression vector.'
+regexes = ['''\b(7cd084941338484aae1ad9425b84077c|4932caff0ff746eab6f01bf08b70ac45|ea1db124af3c7062474693fa704f4ff8)\b''']
+paths = ['''^(docs/internals\.md|tests/bili_test\.cpp)$''']

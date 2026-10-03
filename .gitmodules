@@ -1,0 +1,3 @@
+[submodule "lib/pw-video-simple-interface"]
+	path = lib/pw-video-simple-interface
+	url = https://github.com/zlinux-live-util/pw-video-simple-interface.git

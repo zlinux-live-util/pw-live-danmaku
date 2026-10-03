@@ -1,0 +1,14 @@
+# build output
+build/
+*.o
+*.d
+pw-live-danmaku
+pw-live-danmaku-native
+
+# emitted by `make compile-commands` for clangd / LSP
+compile_commands.json
+
+# never commit a session cookie; --cookie-file points at something like this
+*.cookie
+cookie.txt
+.cookie

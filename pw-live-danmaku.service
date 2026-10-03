@@ -1,0 +1,27 @@
+[Unit]
+Description=bilibili live chat as a PipeWire video node
+Documentation=https://github.com/zlinux-live-util/pw-live-danmaku
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=@REPO@/pw-live-danmaku @ARGS@
+Restart=on-failure
+RestartSec=3
+
+# The program already listens for SIGINT/SIGTERM and quits through the PipeWire loop, so systemd
+# must not also send SIGKILL early: streams must be destroyed from the loop thread or PipeWire
+# reports "pw_stream_destroy called from wrong context".
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Nothing here needs privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The cookie file (if used) is read at startup from $HOME.
+ReadOnlyPaths=%h/.config/pw-live-danmaku
+
+[Install]
+WantedBy=default.target
