@@ -134,6 +134,14 @@ class Panel {
   void rebuildLayer(const std::vector<Message>& msgs);
 
  private:
+  double lineAdvance() const {
+    // The stylesheet's line-height is 1.2em, which is 24px at a 20px font -- exactly the emote box,
+    // leaving no slack. An emote sits on the baseline and occupies the same 24px, so it ends up
+    // touching the row above and pushing into the row below. Give the line whatever it needs to
+    // hold both, with a little breathing room.
+    return std::max(tok_.fontBody * tok_.lineHeight, tok_.emote + 2.0);
+  }
+
   double measureRow(const Message& m, cairo_t* cr, bool* isCard) const;
   double paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const;
   /** Moves the accumulated picture up by h and clears the strip that opens at the bottom, without
@@ -152,9 +160,13 @@ class Panel {
   /** Paints the avatars for every row currently on screen. Separate from paintRow so that a face
    *  arriving after its row was laid out appears without the row having to be redrawn. */
   void drawAvatars(cairo_t* cr) const;
-  /** Draws one inline emote into a box on the current line, or the token as text when the picture
-   *  has not arrived yet or the platform gave no URL for it. */
-  void drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const;
+/** Draws one inline emote into a box whose top edge is boxTop, or the token as text when the picture
+ *  has not arrived yet or the platform gave no URL for it.
+ *
+ *  ascent/descent are the body font's metrics in pixels, needed to centre the fallback text in the
+ *  box; the caller measures them once rather than per emote. */
+void drawEmote(cairo_t* cr, const Fragment& f, double x, double boxTop, double ascent,
+               double descent) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;

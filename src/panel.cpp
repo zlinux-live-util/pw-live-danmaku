@@ -144,7 +144,7 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   const InlineBody body = buildBody(m);
   PangoLayout* l = text_.layout(cr, body.text, spec);
   const int lines = std::max(1, pango_layout_get_line_count(l));
-  const double textH = static_cast<double>(lines) * tok_.fontBody * tok_.lineHeight;
+  const double textH = static_cast<double>(lines) * lineAdvance();
   return std::max(textH, tok_.avatar) + tok_.rowGap;
 }
 
@@ -208,9 +208,9 @@ void Panel::drawAvatars(cairo_t* cr) const {
   }
 }
 
-void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const {
+void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double boxTop, double ascent,
+                      double descent) const {
   const double d = tok_.emote;
-  const double y = lineTop + (lineH - d) / 2.0;
 
   pwvideo::SurfacePtr surf;
   if (emotes_ && !f.url.empty()) surf = emotes_->lookup(f.url);
@@ -224,21 +224,23 @@ void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, 
     ls.bold = true;
     ls.sizePx = tok_.fontBody;
     ls.maxLines = 1;
-    const double ty = y + (d - tok_.fontBody * tok_.lineHeight) / 2.0;
+    // fill() takes a baseline, and the glyph box spans from baseline-ascent to baseline+descent,
+    // so centring it in the picture box works out like this.
+    const double baseline = boxTop + (d - (ascent - descent)) / 2.0 + ascent;
     PangoLayout* l = text_.layout(cr, f.text, ls);
-    pwvideo::TextRenderer::outline(cr, l, x, ty, tok_.outline, rgb(tok_.outlineColor, 0.85));
-    pwvideo::TextRenderer::fill(cr, l, x, ty, rgb(tok_.body));
+    pwvideo::TextRenderer::outline(cr, l, x, baseline, tok_.outline, rgb(tok_.outlineColor, 0.85));
+    pwvideo::TextRenderer::fill(cr, l, x, baseline, rgb(tok_.body));
     return;
   }
 
   cairo_save(cr);
   // Slightly rounded, the way the reference stylesheet's inline images sit in the text flow.
-  pwvideo::roundedRect(cr, x, y, d, d, 4.0);
+  pwvideo::roundedRect(cr, x, boxTop, d, d, 4.0);
   cairo_clip(cr);
   const int sw = cairo_image_surface_get_width(surf.get());
   const int sh = cairo_image_surface_get_height(surf.get());
   if (sw > 0 && sh > 0) {
-    cairo_translate(cr, x, y);
+    cairo_translate(cr, x, boxTop);
     cairo_scale(cr, d / static_cast<double>(sw), d / static_cast<double>(sh));
     cairo_set_source_surface(cr, surf.get(), 0.0, 0.0);
   } else {
@@ -327,7 +329,7 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   PangoLayout* bl = text_.layout(cr, body.text, bs);
 
   const int nLines = std::max(1, pango_layout_get_line_count(bl));
-  const double lh = tok_.fontBody * tok_.lineHeight;
+  const double lh = lineAdvance();
 
   // Collect the line boundaries before drawing anything. TextRenderer owns a single PangoLayout,
   // so laying out a run inside this loop rebinds that same layout and the line list being walked
@@ -339,6 +341,30 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     if (pl) spans.emplace_back(static_cast<size_t>(pl->start_index), static_cast<size_t>(pl->length));
   }
   if (spans.empty()) spans.emplace_back(0, body.text.size());
+
+  // TextRenderer::fill() takes a *baseline*, not a line top: it does a move_to and then
+  // pango_cairo_show_layout, whose origin is the first line's baseline. So an inline emote has to be
+  // placed against that baseline using the font's own ascent and descent, or it hangs entirely
+  // below the text instead of sitting on it.
+  //
+  // Measured with a probe layout here, after the spans above have been read and before the loop
+  // below starts rebinding TextRenderer's single layout -- doing it any earlier would lose the
+  // wrapped line list, doing it per emote would cost a layout each time.
+  double ascent = tok_.fontBody * 0.8;
+  double descent = tok_.fontBody * 0.2;
+  {
+    pwvideo::LabelSpec ps = bs;
+    ps.widthPx = 0.0;  // natural width, so the probe is one line
+    ps.maxLines = 1;
+    PangoLayout* probe = text_.layout(cr, "Ag", ps);
+    int pw = 0, ph = 0;
+    pango_layout_get_pixel_size(probe, &pw, &ph);
+    const int asc = pango_layout_get_baseline(probe) / PANGO_SCALE;
+    if (asc > 0 && ph > asc) {
+      ascent = asc;
+      descent = ph - asc;
+    }
+  }
 
   for (const auto& span : spans) {
     // Pango keeps the newline at the end of a line's text run; drop it before measuring.
@@ -368,7 +394,10 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
         outlined(rl, x, ty, rgb(tok_.body));
         x += rw;
       }
-      drawEmote(cr, m.parts[em.second], x, ty, lh);
+      // The emote's bottom edge sits on the descender line, which is how an inline image aligns with
+      // text. Its top therefore rises a little above the cap height, which is what the reference
+      // stylesheet's 24px emoji against 20px text looks like.
+      drawEmote(cr, m.parts[em.second], x, ty + descent - tok_.emote, ascent, descent);
       x += tok_.emote;
       cursor = em.first + kEmoteCharLen;  // step over the placeholder itself
     }
