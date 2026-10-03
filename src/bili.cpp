@@ -438,32 +438,137 @@ bool Bili::forEachJson(std::string_view message, const JsonVisitor& fn) {
   return true;
 }
 
-bool Bili::parseDanmaku(const Json& json, Danmaku& out) {
-  const std::string cmd = json["cmd"].str();
-  if (cmd != "DANMU_MSG") return false;
-
-  out.cmd = cmd;
-  // info[0] is a mixed array: [? , mode, fontSize, color, timestampMs, rnd, ?, uidHash, ...].
-  // The semantics of the leading field are not pinned down yet and is carried through untyped.
-  const Json& info0 = json["info"].at(0);
-  out.mode = static_cast<int>(info0.at(1).num());
-  out.fontSize = static_cast<int>(info0.at(2).num());
-  out.color = static_cast<uint32_t>(info0.at(3).num()) & 0xFFFFFFu;
-  out.timestampMs = info0.at(4).num();
-  out.text = json["info"].at(1).str();
-  out.user = json["info"].at(2).at(1).str();
-  // info[9].extra is a JSON *string*, so the danmaku kind lives one parse deeper. A malformed
-  // extra must not cost the message, so it is read on a copy and ignored if it does not parse.
-  const std::string extra = json["info"].at(9)["extra"].str();
-  if (!extra.empty()) {
-    std::string err;
-    const Json ex = Json::parse(extra, &err);
-    if (err.empty()) {
-      out.dmType = static_cast<int>(ex["dm_type"].num());
-      if (out.mode == 0) out.mode = static_cast<int>(ex["mode"].num());
-    }
+void Bili::splitFragments(const std::string& text,
+                           const std::vector<std::pair<std::string, Fragment>>& emotes,
+                           std::vector<Fragment>& out) {
+  out.clear();
+  if (emotes.empty()) {
+    if (!text.empty()) out.push_back(Fragment{Fragment::Kind::Text, text, "", 0});
+    return;
   }
-  return true;
+  std::string run;
+  for (size_t i = 0; i < text.size();) {
+    const Fragment* hit = nullptr;
+    size_t hitLen = 0;
+    // Only a bracketed run the platform itself advertised is treated as an emote, so ordinary
+    // brackets in a message stay ordinary brackets.
+    if (text[i] == '[') {
+      for (const auto& e : emotes) {
+        if (e.first.size() > 2 && text.compare(i, e.first.size(), e.first) == 0) {
+          hit = &e.second;
+          hitLen = e.first.size();
+          break;
+        }
+      }
+    }
+    if (hit) {
+      if (!run.empty()) {
+        out.push_back(Fragment{Fragment::Kind::Text, run, "", 0});
+        run.clear();
+      }
+      out.push_back(*hit);
+      i += hitLen;
+      continue;
+    }
+    run.push_back(text[i]);
+    ++i;
+  }
+  if (!run.empty()) out.push_back(Fragment{Fragment::Kind::Text, run, "", 0});
+}
+
+bool Bili::parseMessage(const Json& json, Message& out) {
+  const std::string cmd = json["cmd"].str();
+
+  if (cmd == "DANMU_MSG") {
+    const Json& ia = json["info"];
+    // Verified on the wire: info carries 18 elements and info[0][15] is the object holding both
+    // "extra" and "user". info[9] is a timestamp object and holds no extra -- reading it from
+    // there, as an earlier revision did, silently loses dm_type and every role badge.
+    const Json& head = ia.at(0);
+    const Json& tail = head.at(15);
+
+    out.tsMs = head.at(4).num();
+    out.user = ia.at(2).at(1).str();
+    const std::string text = ia.at(1).str();
+
+    // The emote tokens this particular message used, and where their images live.
+    std::vector<std::pair<std::string, Fragment>> emotes;
+    const std::string extra = tail["extra"].str();
+    if (!extra.empty()) {
+      std::string err;
+      const Json ex = Json::parse(extra, &err);
+      if (err.empty()) {
+        for (const auto& kv : ex["emots"].items()) {
+          Fragment f;
+          f.kind = Fragment::Kind::Emote;
+          f.text = kv.first;
+          f.url = kv.second["url"].str();
+          f.px = static_cast<int>(kv.second["height"].num());
+          emotes.emplace_back(kv.first, std::move(f));
+        }
+      }
+    }
+    splitFragments(text, emotes, out.parts);
+
+    // The user object is what carries the avatar, the name colour and the guard tier. It is
+    // available without a login: only the nickname is masked, not the face.
+    const Json& user = tail["user"];
+    if (user.type() == Json::Type::Object) {
+      const Json& base = user["base"];
+      if (!base["name"].str().empty()) out.user = base["name"].str();
+      out.avatarUrl = base["face"].str();
+      const int64_t nc = base["name_color"].num();
+      if (nc > 0) out.userColor = static_cast<uint32_t>(nc) & 0xFFFFFFu;
+      // guard_level 1 总督, 2 提督, 3 舰长. Only the membership tier is distinguishable here:
+      // the owner and moderator badges are not part of this payload.
+      const int64_t guard = user["guard"]["guard_level"].num();
+      const int64_t medalGuard = user["medal"]["guard_level"].num();
+      if (guard >= 3 || medalGuard >= 3) out.type = UserType::Member;
+    }
+    return true;
+  }
+
+  // The two card kinds below follow the documented field tables but have not yet been observed on
+  // this machine, so every field is read optionally: a document that does not match yields a
+  // message with less in it rather than being dropped.
+  static const std::vector<std::pair<std::string, Fragment>> kNoEmotes;
+
+  if (cmd == "SUPER_CHAT_MESSAGE") {
+    const Json& d = json["data"];
+    out.kind = MsgKind::Paid;
+    out.user = d["uname"].str();
+    out.avatarUrl = d["face"].str();
+    out.tsMs = static_cast<int64_t>(d["start_time"].num() * 1000);
+    const int64_t price = d["price"].num();
+    if (price > 0) out.amount = "CN¥" + std::to_string(price);
+    splitFragments(d["message"].str(), kNoEmotes, out.parts);
+    if (d["medal_info"]["guard_level"].num() >= 3) out.type = UserType::Member;
+    return true;
+  }
+
+  if (cmd == "GUARD_BUY") {
+    const Json& d = json["data"];
+    out.kind = MsgKind::Membership;
+    out.user = d["username"].str();
+    out.tsMs = static_cast<int64_t>(d["start_time"].num() * 1000);
+    // price is in gold, and 1000 gold is one yuan.
+    const int64_t gold = d["price"].num();
+    const int64_t level = d["guard_level"].num();
+    std::string label;
+    if (level == 3) label = "舰长";
+    else if (level == 2) label = "提督";
+    else if (level == 1) label = "总督";
+    if (gold > 0) {
+      const std::string money = "CN¥" + std::to_string(gold / 1000);
+      out.amount = label.empty() ? money : label + " · " + money;
+    } else {
+      out.amount = label;
+    }
+    if (level >= 3) out.type = UserType::Member;
+    return true;
+  }
+
+  return false;
 }
 
 }  // namespace dwm

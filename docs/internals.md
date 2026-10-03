@@ -6,9 +6,11 @@
 
 ## 进度
 
-**M0（协议打通）已完成。** 链路：`room_init` → WBI 签名 `getDanmuInfo` → TLS WebSocket 握手 → JSON 认证包 → brotli 解包 → `DANMU_MSG` 解析 → cairo 渲染 → PipeWire 视频节点 → 消费者落盘。
+**M0（协议打通）与 M1（聊天面板本体）已完成。**
 
-画面目前是**诊断卡片**，不是聊天面板；面板是 M1。
+链路：`room_init` → WBI 签名 `getDanmuInfo` → TLS WebSocket 握手 → JSON 认证包 → brotli 解包 → `Message` → cairo 渲染 → PipeWire 视频节点 → 消费者落盘。
+
+M1 起画面就是聊天面板本身（不是调试卡片）。`--demo` 可以不连网调版面。
 
 ## 进程与线程
 
@@ -150,6 +152,8 @@ info[2][1] 实际值：旱獭邮箱_ / 蔷薇少女3 / 欠***
 
 弹幕正文、颜色、字号、时间戳**全部正常**。所以弹幕显示本身不需要登录；要显示昵称才需要 `SESSDATA`。`--cookie` 就是为这个留的口子。
 
+**但头像不一样：匿名连接照样拿得到。** 这一条纠正了本文早期版本写下的「B 站匿名连接没有头像」——那个结论是错的，因为它是从「昵称被掩码」推出来的，而不是实测。实测 `info[0][15].user.base.face` 是一个完整的 `https://i1.hdslb.com/bfs/face/....jpg`，无需任何凭据。所以头像走的是「拿到 URL → 后台线程下载」的普通图片流程，和 Twitch 侧需求一致。
+
 ### 其他事件类型
 
 实测在同一连接上出现过（`main.cpp` 只取 `DANMU_MSG`，其余记录在卡片上的 `last event`）：
@@ -193,12 +197,118 @@ libcurl 8.x 其实带 WebSocket 支持（`curl_ws_recv` / `curl_ws_send` 符号�
 
 `--cookie` 与 `--cookie-file` 互斥；`--room` 缺失、两者同时给、cookie 文件读不到，都返回非零退出码（**绝不会是 0**，否则 systemd `Restart=always` 下会变成静默重启循环并报告 SUCCESS）。
 
+## `DANMU_MSG` 的真实结构（M1 实测）
+
+抓一条真实弹幕，`info` 有 **18** 个元素，实测输出：
+
+```text
+info 长度: 18
+info[1] text   = 委屈吗？
+info[2][1] name = 友好的益生菌
+info[9]        = {}                      ← 是对象，且为空
+info[0][15] is an object
+  user present = yes
+  base.face       = https://i1.hdslb.com/bfs/face/e9e57ba0...1b1cabe27.jpg
+  base.name       = 友好的益生菌
+  base.name_color = 0
+  guard           = null
+  medal.guard_lvl = 0   medal.name=德云色
+  extra len=984
+  extra.mode=0 dm_type=0 content=委屈吗？
+  info[0][1..4] = mode=1 fs=25 color=16777215 ts=1791051148579
+```
+
+**关键：`extra` 和 `user` 都在 `info[0][15]`，不在 `info[9]`。** `info[9]` 是 `{ct, ts}`。
+
+M0 版本的 `parseDanmaku` 写的是 `json["info"].at(9)["extra"]`，也就是说**它从来没读到过任何 extra**——`dm_type` 恒为 0 只是因为没人看。这个错误当时没能暴露，是因为 `mode` 恰好可以从 `info[0][1]` 拿到，输出看着是对的。**这是"字段读不到"与"字段读对"在外观上无法区分的一个例子**，只能靠打印真实结构来发现。
+
+由此可得的面板需要的东西，全部匿名可得：
+
+| 字段 | 路径 | 用途 |
+| --- | --- | --- |
+| 头像 | `info[0][15].user.base.face` | 24px 圆形头像 |
+| 昵称 | `info[0][15].user.base.name` | 与 `info[2][1]` 一致 |
+| 昵称颜色 | `info[0][15].user.base.name_color` | 十进制 RGB，0 表示无特殊色 |
+| 上舰 | `info[0][15].user.medal.guard_level` 或 `user.guard.guard_level` | 1 总督 / 2 提督 / 3 舰长 |
+| 表情表 | `info[0][15].extra.emots` | `{ "[token]": {url,width,height} }` |
+
+**所以表情图片也是现成的**，不需要自己查表：`extra.emots` 直接给出 token → 图片 URL。
+
+仍然拿不到的：**房管 / 主播身份**。这两个身份不在 `DANMU_MSG` 的载荷里，匿名连接无法区分，所以 B 站侧的用户名着色实际只有「普通」和「舰长」两档。这两个槽位留给 Twitch（`badges` tag 有 moderator/subscriber/broadcaster）。
+
+## 表情弹幕的正文是字面量 token
+
+`extra.emots` 的键就是正文里出现的那段字符串：
+
+```text
+[夏日热浪_想要]   [夏日热浪_爱你]   [夏日热浪_害羞]
+```
+
+所以切分规则是：**只有平台自己声明过的方括号串才算表情**，其余方括号按普通文本处理。`Bili::splitFragments()` 就是这么做的，单测里有一条专门钉住「未声明的方括号不被吞掉」。
+
+## M1 渲染侧：三个必须遵守的约束
+
+### 一、`TextRenderer` 只有一个 PangoLayout
+
+`TextRenderer::layout()` 复用同一个 `PangoLayout`，每次调用都把它重新绑定到传入的 context。这在「一次排版、一次绘制」时是优点（比每次新建 layout 便宜），但**在遍历排版结果的循环里是陷阱**：
+
+```cpp
+PangoLayout* bl = text_.layout(cr, body, bs);          // 拿到整个正文的 layout
+for (int i = 0; i < pango_layout_get_line_count(bl); ++i) {
+  PangoLayoutLine* pl = pango_layout_get_line_readonly(bl, i);
+  std::string slice = body.substr(pl->start_index, pl->length);
+  text_.layout(cr, slice, ls);                          // ← 把 bl 本身覆盖掉了
+  outlined(bl, ...);                                    // bl 已经指向 slice 的单行 layout
+}
+```
+
+症状是**换行的第二行及以后整段丢失**，而且第一行的内容也会错乱。正确写法是**先把所有行区间收集到一个 vector，再开始画**。
+
+### 二、测量与绘制必须用同一个折行宽度
+
+第一版 `measureRow()` 用整个可用宽度排版，`paintRow()` 却用 `可用宽度 - 昵称宽度` 排版（因为首行要和昵称并排）。于是 measure 算出一行的高度、paint 画出两行，超出部分被下一条消息的移位覆盖——**又是一个「少了一截但看不出原因」的症状**。
+
+现在 `measureRow()` 也先量昵称宽度，再用同一个 `avail - nw` 排版正文，两者必然一致。
+
+### 三、入场动画会让「同一时刻的 update + render」拍到全透明
+
+新消息不进静态层，而是作为「正在淡入的那一条」由 `render()` 逐帧叠加，200ms 后才烘进静态层。所以如果 `update(fresh, now)` 和 `render(cr, now)` 用**同一个** `now`，动画进度就是 `t=0` → alpha 0 → **整帧空白**。
+
+这不是理论问题：M1 的 `--dump` 第一版就是这样，对着一个确实收到 3 条消息的房间拍出了一张全空白 PNG。
+
+`--dump` 因此先连续渲染 12 帧（每帧 +33ms）再取最后一帧，把动画推到结束之后——与姊妹项目对自己有状态后处理效果的做法一致。
+
+## M1 的性能做法
+
+**静态层 + 增量移位。** 文字排好之后就不再变，所以整个画面累积在一张 ARGB32 静态层表面上；每来一条新消息，只把已有内容整体上移一行的高度，再在新露出的底部条带里画这一条。
+
+- 「上移一行」是把表面画到自身偏移一行的位置——这是**自重叠 blit**，pixman 会正确处理重叠区，行为等同 `memmove`，不会糊。
+- 因此**每条消息的开销正比于它自己的高度，而不是整个面板**。M0 的做法（每帧重新排版全部可见行）会让开销正比于可见行数 × 消息速率，在热闹房间里成为主要开销。
+- 帧路径上没有新消息时，一帧就是一次整块拷贝。
+- `rows_` 里已经滚出面板的行会被裁掉，因此不会随运行时长增长；面板也不保留已绘制的消息正文（像素已经在静态层里），所以帧回调不需要为它们分配任何东西。
+
+**实测**（480×900，30fps，消费者接满 900 帧，30 秒内收到 29 条真实消息）：进程 `utime+stime` 为 **0 tick**（即不足 1 秒 CPU / 约 24 秒墙钟），帧数落盘 103,680,000 字节 = 60 × 480 × 900 × 4，逐字节吻合。
+
+注意「0 tick」这个量级下测量方法本身是粗的（100 tick = 1s），只能说**远低于 3% 单核**，不能当作精确值。要更细的数需要 `perf` 或更长的采样。
+
+## 卡片类消息：字段来自文档，尚未在本机观测到
+
+`SUPER_CHAT_MESSAGE` 与 `GUARD_BUY` 走的是同一条连接（只是 `cmd` 不同），字段名取自 `pskdje/bilibili-API-collect` 的 `docs/live/message_stream.md`：
+
+| cmd | 取用字段 | 渲染 |
+| --- | --- | --- |
+| `SUPER_CHAT_MESSAGE` | `data.uname` / `face` / `message` / `price` / `start_time` | 付费卡（青色） |
+| `GUARD_BUY` | `data.username` / `guard_level` / `price`（金瓜子，1000 = 1 元） | 上舰卡（实心绿） |
+
+**这两条尚未在本机抓到真实样本**，所以解析器里每个字段都是可选的：字段对不上时得到一条内容更少的消息，而不是把消息丢掉。面板侧的两种卡片样式则已经按参考 CSS 实现在 `--demo` 里（并有单测钉住字段映射）。
+
 ## 未实测 / 已知缺口
 
-- 顶部 / 底部 / 逆向 / 高级弹幕的 `mode` 取值语义（需要热闹房间的全模式样本）。
-- 弹幕洪峰下的行为（本机实测的三个房间都很安静，45 s 内最多 3 条）。热门房间可能到每秒数十条，届时需要有界队列与丢弃策略。
-- 断线重连：M0 失败即退出并把原因打在卡片上，**故意不做静默重连**——静默重连恰好会掩盖本里程碑要观察的东西。
-- 头像与表情图（Twitch 侧才有真正的图片需求；B 站匿名连接没有头像）。
+- `SUPER_CHAT_MESSAGE` / `GUARD_BUY` 的真实载荷（本机这几个房间都太安静）。
+- 顶部 / 底部 / 逆向 / 高级弹幕的 `mode` 取值语义。对叠加层来说**这很可能不重要**：面板本来就把它们当普通文本行渲染，`mode` 只影响弹幕在视频上的位置，不影响聊天气泡。
+- 弹幕洪峰。本机样本房间 30 秒最多 29 条；热门房间会到每秒数十条。已有界队列（`kPendingCap=400`）与每帧上限（`kMaxPerFrame=40`）兜底，但丢弃策略尚未在高流量下验证。
+- 表情**图片**。`extra.emots` 已经给出 URL，`Message::Fragment` 也已经带了，但面板目前把表情 token 按字面文本画。要画成图片需要一个图片缓存（同头像那套 `AvatarStore` 的路子）。
+- Twitch：IRC 正在退役（见评估），EventSub 需要用户自带 token。
 
 ## 调试方法
 

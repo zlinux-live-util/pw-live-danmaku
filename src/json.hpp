@@ -11,7 +11,6 @@
 // Errors are reported by parse()'s return value and never by throwing: the payloads arrive from
 // the network, so malformed input is a fact to handle, not an exceptional condition.
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -59,6 +58,11 @@ class Json {
   const Json& get(std::string_view key) const { return (*this)[key]; }
 
   bool has(std::string_view key) const { return !(*this)[key].isNull(); }
+
+  /** Object members in document order. Needed to walk a keyed map -- bilibili's extra.emots maps
+   *  an emote token such as "[热]" to its image record, and there is no other way to enumerate
+   *  the keys. Returns an empty vector for any other type. */
+  const std::vector<std::pair<std::string, Json>>& items() const { return obj_; }
 
  private:
   Type type_ = Type::Null;

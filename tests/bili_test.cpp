@@ -11,6 +11,7 @@
 
 #include "bili.hpp"
 #include "json.hpp"
+#include "message.hpp"
 
 namespace {
 
@@ -173,51 +174,121 @@ void testForEachJsonStopsEarly() {
   checkEqInt(visited, 1, "visitor: early stop honoured");
 }
 
-// A real DANMU_MSG body as it arrives on the wire (nickname masked, because the capture was made
-// without a login cookie). One "info" key holding every element: info[0] is the mode array,
-// info[1] the text, info[2] the sender, info[9] the user/extra object.
+// A DANMU_MSG body shaped like the one measured on the wire: one "info" array holding everything,
+// with info[0][15] carrying both "extra" (a JSON string) and "user". Using the real shape matters
+// here -- an earlier revision read the extras from info[9], which is a timestamp object, so every
+// field it tried to read was silently absent and the tests passed against a fixture with the same
+// mistake in it.
 void testParseDanmaku() {
-  const std::string body =
-      R"({"cmd":"DANMU_MSG","dm_v2":"","info":[)"
-      R"([0,1,25,16777215,1791046553806,-1688173992,0,"f9d986db",0,0,0,"",0,"{}","{}",)"
-      R"({"extra":"{\"mode\":1,\"dm_type\":0}"}],)"
-      R"("老丈人只为名",)"
-      R"([0,"旱獭邮箱_",0,0,0,10000,1,""],)"
-      R"([10,0,16777215,6406235,"{}",0],["",""],0,0,0,0,)"
-      R"({"extra":"{\"mode\":1,\"dm_type\":0}","user":{"base":{"name":"旱獭邮箱_"}}}]})";
+  // A custom raw-string delimiter (R"J(...)J") rather than the default: these fixtures contain
+  // }] and ,) sequences, and the default R"( ... )" would terminate on the first )" it met.
+  const std::string body = R"J({"cmd":"DANMU_MSG","dm_v2":"","info":[
+   [0,1,25,16777215,1791046553806,-1688173992,0,"f9d986db",0,0,0,"",0,"{}","{}",
+    {"mode":0,"show_player_type":0,
+     "extra":"{\"mode\":1,\"dm_type\":0}",
+     "user":{"base":{"face":"https://i1.hdslb.com/bfs/face/abc.jpg","name":"旱獭邮箱_",
+                     "name_color":16711680},
+             "medal":{"guard_level":3,"name":"德云色"}}}],
+   "老丈人只为名",
+   [0,"旱獭邮箱_",0,0,0,10000,1,""],
+   [10,0,16777215,6406235,"{}",0],["",""],0,0,0,0,
+   {"ct":"AFFF4206","ts":1791046553},0,0,null,null,0,1040,[49],null]})J";
 
-  Danmaku d;
-  const bool parsed = Bili::parseDanmaku(Json::parse(body), d);
+  Message m;
+  const bool parsed = Bili::parseMessage(Json::parse(body), m);
   check(parsed, "DANMU_MSG: recognised");
   if (!parsed) return;
-  checkEq(d.text, "老丈人只为名", "DANMU_MSG: text from info[1]");
-  checkEq(d.user, "旱獭邮箱_", "DANMU_MSG: masked nickname from info[2][1]");
-  checkEqInt(d.mode, 1, "DANMU_MSG: scroll mode");
-  checkEqInt(d.fontSize, 25, "DANMU_MSG: font size");
-  checkEqInt(d.color, 0xFFFFFFu, "DANMU_MSG: colour");
-  checkEq(std::to_string(d.timestampMs), "1791046553806", "DANMU_MSG: timestamp");
+  checkEq(m.plainText(), "老丈人只为名", "DANMU_MSG: text from info[1]");
+  checkEq(m.user, "旱獭邮箱_", "DANMU_MSG: name");
+  checkEq(m.avatarUrl, "https://i1.hdslb.com/bfs/face/abc.jpg", "DANMU_MSG: face from info[0][15]");
+  checkEqInt(m.userColor, 16711680u, "DANMU_MSG: name colour");
+  checkEqInt(static_cast<int>(m.type), static_cast<int>(UserType::Member),
+            "DANMU_MSG: guard_level 3 becomes Member");
+  checkEqInt(m.tsMs, 1791046553806LL, "DANMU_MSG: timestamp");
+  checkEqInt(static_cast<int>(m.kind), static_cast<int>(MsgKind::Text), "DANMU_MSG: plain text kind");
+  checkEqInt(m.parts.size(), size_t(1), "DANMU_MSG: no emotes, so one text fragment");
 }
 
+// Emote danmaku: the token is literal in the body and extra.emots maps it to an image.
 void testParseDanmakuEmote() {
-  // Emote danmaku carry the literal token in the text, e.g. "[夏日热浪_想要]".
-  const std::string body =
-      R"({"cmd":"DANMU_MSG","info":[)"
-      R"([0,1,25,16777215,1791046559000,1,0,"h",0,0,0,"",0,"{}","{}",)"
-      R"({"extra":"{\"dm_type\":1}"}],)"
-      R"("[夏日热浪_想要]",)"
-      R"([0,"user",0,0,0,10000,1,""],[10,0,16777215,0,"{}",0],["",""],0,0,0,0,)"
-      R"({"extra":"{\"dm_type\":1}","user":{"base":{"name":"user"}}}]})";
-  Danmaku d;
-  check(Bili::parseDanmaku(Json::parse(body), d), "emote danmaku: recognised");
-  checkEq(d.text, "[夏日热浪_想要]", "emote danmaku: token preserved verbatim");
+  const std::string body = R"J({"cmd":"DANMU_MSG","info":[
+   [0,1,25,16777215,1791046559000,1,0,"h",0,0,0,"",0,"{}","{}",
+    {"extra":"{\"mode\":1,\"dm_type\":1,\"emots\":{\"[夏日热浪_想要]\":{\"url\":\"https://i0.hdslb.com/bfs/live/x.png\",\"width\":20,\"height\":20}}}",
+     "user":{"base":{"name":"user","face":""}}}],
+   "白花300块[夏日热浪_想要]",
+   [0,"user",0,0,0,10000,1,""],
+   [10,0,0,0,"{}",0],["",""],0,0,0,0,
+   {"ct":"x","ts":1},0,0,null,null,0,1,[1],null]})J";
+
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "emote danmaku: recognised");
+  // Three fragments: the leading text, the emote, and nothing trailing.
+  checkEqInt(m.parts.size(), size_t(2), "emote danmaku: text split around the token");
+  if (m.parts.size() == 2) {
+    checkEq(m.parts[0].text, "白花300块", "emote danmaku: leading text run");
+    checkEqInt(static_cast<int>(m.parts[1].kind), static_cast<int>(Fragment::Kind::Emote),
+              "emote danmaku: second fragment is an emote");
+    checkEq(m.parts[1].text, "[夏日热浪_想要]", "emote danmaku: token kept as typed");
+    checkEq(m.parts[1].url, "https://i0.hdslb.com/bfs/live/x.png", "emote danmaku: image url");
+    checkEqInt(m.parts[1].px, 20, "emote danmaku: advertised size");
+  }
+  // Brackets that the platform did not advertise stay literal text.
+  checkEq(m.plainText(), "白花300块[夏日热浪_想要]", "emote danmaku: plain text round-trips");
+}
+
+// The two card kinds follow the documented field tables but have not been observed on this
+// machine, so these tests pin the mapping rather than a capture.
+void testParsePaidCard() {
+  const std::string body = R"J({"cmd":"SUPER_CHAT_MESSAGE","data":{"uname":"五条悟","face":"https://f/x.jpg","message":"已经没有什么可怕的了","price":30,"start_time":1791046553,"medal_info":{"guard_level":3}}})J";
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "SUPER_CHAT_MESSAGE: recognised");
+  checkEqInt(static_cast<int>(m.kind), static_cast<int>(MsgKind::Paid), "SC: kind is Paid");
+  checkEq(m.user, "五条悟", "SC: user");
+  checkEq(m.plainText(), "已经没有什么可怕的了", "SC: message");
+  checkEq(m.amount, "CN¥30", "SC: price");
+  checkEqInt(m.tsMs, 1791046553000LL, "SC: start_time is seconds, converted to ms");
+}
+
+void testParseMembershipCard() {
+  // price is in gold, and 1000 gold is one yuan.
+  const std::string body = R"J({"cmd":"GUARD_BUY","data":{"uid":1,"username":"xfgryujk","guard_level":3,"num":1,"price":198000,"start_time":1791046553}})J";
+  Message m;
+  check(Bili::parseMessage(Json::parse(body), m), "GUARD_BUY: recognised");
+  checkEqInt(static_cast<int>(m.kind), static_cast<int>(MsgKind::Membership), "GUARD: kind");
+  checkEq(m.user, "xfgryujk", "GUARD: user");
+  checkEq(m.amount, "舰长 · CN¥198", "GUARD: tier and price converted from gold");
+  checkEqInt(static_cast<int>(m.type), static_cast<int>(UserType::Member), "GUARD: membership tier");
+}
+
+void testSplitFragments() {
+  std::vector<std::pair<std::string, Fragment>> emotes;
+  Fragment f;
+  f.kind = Fragment::Kind::Emote;
+  f.text = "[笑哭]";
+  emotes.emplace_back("[笑哭]", f);
+
+  std::vector<Fragment> out;
+  // The bracketed run the platform did not advertise must not be swallowed.
+  Bili::splitFragments("a[not an emote]b[笑哭]c", emotes, out);
+  checkEqInt(out.size(), size_t(3), "split: text, emote, trailing text");
+  if (out.size() == 3) {
+    checkEq(out[0].text, "a[not an emote]b", "split: unknown brackets stay in the text run");
+    checkEq(out[1].text, "[笑哭]", "split: the advertised token became a fragment");
+    checkEq(out[2].text, "c", "split: trailing text");
+  }
+
+  Bili::splitFragments("", emotes, out);
+  checkEqInt(out.size(), size_t(0), "split: empty text yields no fragments");
+  Bili::splitFragments("plain", emotes, out);
+  checkEqInt(out.size(), size_t(1), "split: no match yields one text run");
 }
 
 void testParseIgnoresOtherCmds() {
   for (const char* cmd : {"LOG_IN_NOTICE", "NOTICE_MSG", "WATCHED_CHANGE", "ONLINE_RANK_COUNT",
-                          "STOP_LIVE_ROOM_LIST", "SEND_GIFT"}) {
-    Danmaku d;
-    check(!Bili::parseDanmaku(Json::parse(std::string(R"({"cmd":")") + cmd + R"("})"), d),
-          cmd);
+                          "STOP_LIVE_ROOM_LIST", "SEND_GIFT", "INTERACT_WORD", "SUPER_CHAT_MESSAGE"
+                                                                              "_UNKNOWN"}) {
+    Message m;
+    check(!Bili::parseMessage(Json::parse(std::string(R"({"cmd":")") + cmd + R"("})"), m), cmd);
   }
 }
 
@@ -249,6 +320,9 @@ int main() {
   testForEachJsonStopsEarly();
   testParseDanmaku();
   testParseDanmakuEmote();
+  testSplitFragments();
+  testParsePaidCard();
+  testParseMembershipCard();
   testParseIgnoresOtherCmds();
   testAuthPacketLayout();
 

@@ -1,15 +1,20 @@
 // pw-live-danmaku (native) -- bilibili live chat as a PipeWire video node.
 //
-// M0 scope: prove the chain end to end. HTTP bootstrap -> websocket -> auth -> brotli -> DANMU_MSG,
-// and the frames out through the video node. The picture is a diagnostic card, not the chat panel:
-// the panel is M1. What is deliberately settled here is the part that is hardest to change later --
-// the thread split, the handoff to the render callback, and the CLI surface.
+// Thread split, which is the part that is hardest to change later:
+//   main thread    : pwvideo::VideoNode::run(); the frame callback renders from a snapshot
+//   site thread    : HTTP bootstrap, websocket, protocol decode; appends to Shared::pending
+//   avatar thread  : fetches and decodes face images, because AssetCache::get blocks
+//
+// The frame callback never touches the network and never waits on the site thread: it drains the
+// pending queue under a short lock, hands the new messages to the panel, and copies the panel's
+// static layer into the frame.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -17,10 +22,12 @@
 
 #include <cairo/cairo.h>
 
+#include "avatars.hpp"
 #include "bili.hpp"
 #include "cairo_util.hpp"
+#include "message.hpp"
+#include "panel.hpp"
 #include "pwvideo.hpp"
-#include "text.hpp"
 #include "ws.hpp"
 
 namespace {
@@ -33,11 +40,24 @@ int64_t steadyMs() {
       .count();
 }
 
-/** Font chain. The comma form is a pango fallback chain resolved per character, so latin glyphs can
- *  come from one family and CJK from another. Overridable from M1 onwards with --font. */
-constexpr const char* kFontChain = "Noto Sans CJK SC,Noto Sans SC,DejaVu Sans,sans-serif";
+/** Font chain. The comma form is a pango fallback chain resolved per character, so latin glyphs
+ *  can come from one family and CJK from another. */
+constexpr const char* kFontChain = "Noto Sans CJK SC,Sarasa Mono CL,DejaVu Sans,sans-serif";
 
-constexpr size_t kRecentKeep = 12;  // rows the diagnostic card shows
+/** Bounds how much work one frame can be asked to do. A burst of messages arriving while nobody was
+ *  consuming frames is drained over several frames rather than all at once, so a flood cannot make
+ *  a single frame arbitrarily expensive. */
+constexpr size_t kMaxPerFrame = 40;
+
+/** Bounds the queue when no consumer is attached. Without this an overlay left running for hours
+ *  would accumulate every message that arrived. */
+constexpr size_t kPendingCap = 400;
+
+PanelTokens defaultTokens() {
+  PanelTokens t;
+  t.font = kFontChain;
+  return t;
+}
 
 void usage(std::FILE* out) {
   std::fprintf(
@@ -45,13 +65,16 @@ void usage(std::FILE* out) {
       "pw-live-danmaku (native)\n"
       "\n"
       "  --room ID|URL      Bilibili room, e.g. 545068 or https://live.bilibili.com/545068\n"
-      "                     Required. A b23.tv short link also works.\n"
+      "                     Required unless --demo is given. A b23.tv short link also works.\n"
       "  --cookie STR       Raw cookie header from the browser, e.g.\n"
       "                     \"SESSDATA=...; bili_jct=...; DedeUserID=...\".\n"
       "                     Optional: anonymous works but masks nicknames. Visible in ps(1),\n"
       "                     so prefer --cookie-file.\n"
       "  --cookie-file PATH Read the cookie from a file instead; recommended, since the file can\n"
       "                     be chmod 600 and the value never reaches the process arguments.\n"
+      "  --font NAME[,...]  Font family chain for the panel, default a CJK-capable fallback chain\n"
+      "  --font-file PATH   Register a font file (or a directory) with fontconfig at startup;\n"
+      "                     repeatable. Without --font its own family name is used\n"
       "  --node NAME        PipeWire node name, default pw-live-danmaku\n"
       "  --desc TEXT        Node description (this is what the OBS dropdown shows), default\n"
       "                     \"Live Chat\"\n"
@@ -59,9 +82,11 @@ void usage(std::FILE* out) {
       "                     a smaller negotiated size is clipped, not scaled.\n"
       "  --fps N            Frame-rate ceiling, default 30\n"
       "  --dump FILE        Render one sample frame to PNG and exit\n"
-      "  --count N          Exit after receiving N danmaku (0 = never)\n"
+      "  --count N          Exit after receiving N messages (0 = never)\n"
       "  --seconds N        Exit after N seconds (0 = never)\n"
-      "  --verbose, -v      Log the protocol handshake and every parsed danmaku\n"
+      "  --demo             Draw a fixed set of messages and no network at all, for tuning the\n"
+      "                     layout without a live room. Overrides --room.\n"
+      "  --verbose, -v      Log the protocol handshake and every parsed message\n"
       "  --help, -h\n");
 }
 
@@ -70,9 +95,16 @@ void usage(std::FILE* out) {
  *  be a silent restart loop reporting SUCCESS. */
 enum class Args { Ok, Help, Error };
 
-Args parseArgs(int argc, char** argv, std::string& room, std::string& cookie,
-               std::string& cookieFile, std::string& node, std::string& desc, int& width,
-               int& height, int& fps, std::string& dump, int& count, int& seconds, bool& verbose) {
+struct Options {
+  std::string room, cookie, cookieFile, node = "pw-live-danmaku", desc = "Live Chat";
+  std::string dump;
+  std::vector<std::string> fontFiles;
+  std::string font;
+  int width = 480, height = 900, fps = 30, count = 0, seconds = 0;
+  bool verbose = false, demo = false;
+};
+
+Args parseArgs(int argc, char** argv, Options& o) {
   auto next = [&](int& i) -> std::string {
     if (i + 1 >= argc) throw std::runtime_error("missing argument value");
     return argv[++i];
@@ -83,34 +115,40 @@ Args parseArgs(int argc, char** argv, std::string& room, std::string& cookie,
       usage(stdout);
       return Args::Help;
     } else if (a == "--room") {
-      room = next(i);
+      o.room = next(i);
     } else if (a == "--cookie") {
-      cookie = next(i);
+      o.cookie = next(i);
     } else if (a == "--cookie-file") {
-      cookieFile = next(i);
+      o.cookieFile = next(i);
+    } else if (a == "--font") {
+      o.font = next(i);
+    } else if (a == "--font-file") {
+      o.fontFiles.push_back(next(i));
     } else if (a == "--node") {
-      node = next(i);
+      o.node = next(i);
     } else if (a == "--desc") {
-      desc = next(i);
+      o.desc = next(i);
     } else if (a == "--size") {
       const std::string v = next(i);
       const size_t x = v.find_first_of("xX*");
       if (x == std::string::npos) {
-        width = height = std::max(64, std::stoi(v));
+        o.width = o.height = std::max(64, std::stoi(v));
       } else {
-        width = std::max(64, std::stoi(v.substr(0, x)));
-        height = std::max(64, std::stoi(v.substr(x + 1)));
+        o.width = std::max(64, std::stoi(v.substr(0, x)));
+        o.height = std::max(64, std::stoi(v.substr(x + 1)));
       }
     } else if (a == "--fps") {
-      fps = std::max(1, std::stoi(next(i)));
+      o.fps = std::max(1, std::stoi(next(i)));
     } else if (a == "--dump") {
-      dump = next(i);
+      o.dump = next(i);
     } else if (a == "--count") {
-      count = std::max(0, std::stoi(next(i)));
+      o.count = std::max(0, std::stoi(next(i)));
     } else if (a == "--seconds") {
-      seconds = std::max(0, std::stoi(next(i)));
+      o.seconds = std::max(0, std::stoi(next(i)));
+    } else if (a == "--demo") {
+      o.demo = true;
     } else if (a == "--verbose" || a == "-v") {
-      verbose = true;
+      o.verbose = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n\n", a.c_str());
       usage(stderr);
@@ -120,56 +158,48 @@ Args parseArgs(int argc, char** argv, std::string& room, std::string& cookie,
   return Args::Ok;
 }
 
-/** A copy of everything the renderer needs, taken under the lock in one go. The render callback
- *  runs on the PipeWire main-loop thread and may not block on the network, so it renders from a
- *  value rather than holding a reference into live state -- the same shape the sibling project uses
- *  for its cover art. */
-struct Snapshot {
-  std::string state;
+/** State shared between the site thread and the frame callback. */
+struct Shared {
+  mutable std::mutex mu;
+  std::string state = "starting";
   std::string roomLabel;
   std::string lastEvent;
-  std::vector<Danmaku> recent;
-  uint64_t total = 0;
-  uint64_t dropped = 0;
-};
+  std::deque<Message> pending;
+  uint64_t total = 0, dropped = 0;
 
-struct Shared {
-  // mutable because snapshot() is a logically-const read that still has to take the lock.
-  mutable std::mutex mu;
-  Snapshot live;
-
-  Snapshot snapshot() const {
+  void append(Message m) {
     std::lock_guard<std::mutex> lk(mu);
-    return live;
-  }
-  void push(const Danmaku& d) {
-    std::lock_guard<std::mutex> lk(mu);
-    ++live.total;
-    if (live.recent.size() >= kRecentKeep) live.recent.erase(live.recent.begin());
-    live.recent.push_back(d);
+    ++total;
+    pending.push_back(std::move(m));
+    while (pending.size() > kPendingCap) {
+      pending.pop_front();
+      ++dropped;
+    }
   }
   void note(const std::string& event) {
     std::lock_guard<std::mutex> lk(mu);
-    live.lastEvent = event;
+    lastEvent = event;
   }
   void setState(std::string s) {
     std::lock_guard<std::mutex> lk(mu);
-    live.state = std::move(s);
-  }
-  void drop() {
-    std::lock_guard<std::mutex> lk(mu);
-    ++live.dropped;
+    state = std::move(s);
   }
 };
 
-/** The site thread: bootstrap over HTTP, then hold the websocket open, decoding into Shared.
- *
- *  Reconnect is M1 work; M0 reports the failure and stops, because a silent reconnect loop would
- *  hide exactly the thing this milestone exists to observe. video may be null when running for
- *  --dump, in which case there is nothing to quit and the loop just runs until the stop flag. */
-void siteLoop(Shared& sh, Bili& bili, const std::string& roomInput, bool verbose,
-              std::atomic<bool>& stop, pwvideo::VideoNode* video, std::atomic<int>& received,
-              int count) {
+/** Moves at most kMaxPerFrame messages into out, so one frame's cost stays bounded however large
+ *  the backlog is. The lock is held only for the moves. */
+void drain(Shared& sh, std::vector<Message>& out) {
+  out.clear();
+  std::lock_guard<std::mutex> lk(sh.mu);
+  while (!sh.pending.empty() && out.size() < kMaxPerFrame) {
+    out.push_back(std::move(sh.pending.front()));
+    sh.pending.pop_front();
+  }
+}
+
+void siteLoop(Shared& sh, Bili& bili, AvatarStore& avatars, const std::string& roomInput,
+              bool verbose, std::atomic<bool>& stop, pwvideo::VideoNode* video,
+              std::atomic<int>& received, int count) {
   try {
     sh.setState("resolving room");
     const int64_t roomId = bili.resolveRoom(roomInput);
@@ -220,7 +250,7 @@ void siteLoop(Shared& sh, Bili& bili, const std::string& roomInput, bool verbose
       const Json root = Json::parse(reply, &err);
       if (err.empty() && root["code"].num() == 0) {
         authed = true;
-        break;  // leave the wait loop and fall through to the streaming loop
+        break;
       }
       // The reply is a short JSON blob from the server and carries no user data.
       sh.setState("auth rejected: " + reply);
@@ -244,7 +274,6 @@ void siteLoop(Shared& sh, Bili& bili, const std::string& roomInput, bool verbose
           sh.setState("heartbeat failed: " + ws.lastError());
           return;
         }
-        if (verbose) std::fprintf(stderr, "[site] heartbeat\n");
       }
       if (ev == WsClient::Event::Timeout) continue;
       if (ev == WsClient::Event::Error || ev == WsClient::Event::Close) {
@@ -253,26 +282,24 @@ void siteLoop(Shared& sh, Bili& bili, const std::string& roomInput, bool verbose
         return;
       }
 
-      // The same walk handles both shapes a command message can take: a bare JSON document, and a
-      // brotli batch of framed packets.
       Bili::forEachJson(msg, [&](std::string_view doc) {
         std::string err;
         const Json json = Json::parse(doc, &err);
-        if (!err.empty()) {
-          sh.drop();
-          return true;
-        }
-        Danmaku d;
-        if (!Bili::parseDanmaku(json, d)) {
+        if (!err.empty()) return true;
+        Message m;
+        if (!Bili::parseMessage(json, m)) {
           const std::string cmd = json["cmd"].str();
           if (!cmd.empty()) sh.note(cmd);
           return true;
         }
-        sh.push(d);
-        const int n = received.fetch_add(1) + 1;
+        // Face images are fetched by the avatar thread; this only records the wish.
+        if (!m.avatarUrl.empty()) avatars.request(m.avatarUrl);
         if (verbose)
-          std::fprintf(stderr, "[dm] mode=%d fs=%d color=%06x %s: %s\n", d.mode, d.fontSize, d.color,
-                       d.user.c_str(), d.text.c_str());
+          std::fprintf(stderr, "[msg] %s%s: %s\n",
+                       m.kind == MsgKind::Text ? "" : (m.kind == MsgKind::Paid ? "[paid] " : "[sub] "),
+                       m.user.c_str(), m.plainText().c_str());
+        sh.append(std::move(m));
+        const int n = received.fetch_add(1) + 1;
         if (count > 0 && n >= count) {
           if (verbose) std::fprintf(stderr, "[site] reached --count %d\n", count);
           stop.store(true);
@@ -287,67 +314,71 @@ void siteLoop(Shared& sh, Bili& bili, const std::string& roomInput, bool verbose
   }
 }
 
-/** The diagnostic card. Replaced by the chat panel in M1; what it does prove is that the node
- *  carries pixels at the negotiated size, with alpha, to whatever consumer attaches. */
-void drawDiagnostic(cairo_t* cr, const Snapshot& snap, int w) {
-  cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_rgba(cr, 0, 0, 0, 0.30);
-  cairo_paint(cr);
-  cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-
-  pwvideo::TextRenderer text;
-  const double pad = 14.0;
-  double y = pad + 18.0;
-
-  auto line = [&](const std::string& s, double size, const pwvideo::Rgba& color, bool bold) {
-    pwvideo::LabelSpec spec;
-    spec.sizePx = size;
-    spec.bold = bold;
-    spec.center = false;
-    spec.widthPx = w - 2 * pad;
-    spec.maxLines = 1;
-    spec.family = kFontChain;
-    PangoLayout* l = text.layout(cr, s, spec);
-    text.outline(cr, l, pad, y, 1.5, pwvideo::Rgba{0, 0, 0, 0.85});
-    text.fill(cr, l, pad, y, color);
-    const pwvideo::LabelMetrics m = pwvideo::TextRenderer::measure(l);
-    y += m.height + 6.0;
+/** A fixed set of messages covering every case the panel has to draw: latin and CJK names, an
+ *  emoji, a line that wraps, each role colour, a paid card, a membership card, and two strings that
+ *  must be rendered as literal text. The last two are the important ones: markup arriving in chat
+ *  has to be drawn as glyphs, and cairo plus pango do that by construction because there is no
+ *  markup interpretation anywhere in this path. */
+std::vector<Message> demoMessages() {
+  struct Spec {
+    const char* user;
+    UserType type;
+    const char* text;
   };
-
-  const pwvideo::Rgba white{1, 1, 1, 1};
-  const pwvideo::Rgba dim{0.78, 0.83, 0.88, 1};
-  const pwvideo::Rgba bad{1.0, 0.45, 0.45, 1};
-
-  line("pw-live-danmaku M0", 22.0, white, true);
-  line("room " + snap.roomLabel, 14.0, dim, false);
-  line(snap.state, 14.0, snap.state.rfind("failed", 0) == 0 ? bad : dim, false);
-  char counts[128];
-  std::snprintf(counts, sizeof(counts), "received %llu   dropped %llu",
-                static_cast<unsigned long long>(snap.total),
-                static_cast<unsigned long long>(snap.dropped));
-  line(counts, 14.0, dim, false);
-  if (!snap.lastEvent.empty()) line("last event: " + snap.lastEvent, 13.0, dim, false);
-  y += 8.0;
-  line("--- danmaku ---", 14.0, white, true);
-
-  for (const Danmaku& d : snap.recent) {
-    pwvideo::Rgba col{((d.color >> 16) & 0xFF) / 255.0, ((d.color >> 8) & 0xFF) / 255.0,
-                      (d.color & 0xFF) / 255.0, 1.0};
-    line(d.user + ": " + d.text, 14.0, col, false);
+  const Spec plain[] = {
+      {"博丽灵梦", UserType::Normal, "DU↗DU→DU↗DU↓ Max Verstappen"},
+      {"Jim Hacker", UserType::Moderator, "Remember... no Russian"},
+      {"Makarov", UserType::Normal, "🔨⚓ 我不做人了，JOJO"},
+      {"Rick Astley", UserType::Member, "🎉 让我看看"},
+      {"孙悟空", UserType::Normal, "🎉 23333"},
+      {"哈基米", UserType::Normal, "⚓ <img src=1 onerror=\"alert('CHECK YOUR CODE')\">"},
+      {"孙悟空", UserType::Normal, "你这猴儿，真令我欢喜"},
+      {"Tifa Lockhart", UserType::Moderator, "🔨🎉 Remember... no Russian"},
+      {"五条悟", UserType::Normal, "<script>alert(\"CHECK YOUR CODE\")</script>"},
+      {"長崎そよ", UserType::Normal, "逃げるんだよ！"},
+      {"柚木つばめ", UserType::Normal, "会員的"},
+      {"御剑传奇", UserType::Normal, "無駄無駄無駄無駄無駄無駄無駄無駄無駄無駄"},
+  };
+  std::vector<Message> out;
+  for (const Spec& s : plain) {
+    Message m;
+    m.user = s.user;
+    m.type = s.type;
+    m.parts.emplace_back(Fragment{Fragment::Kind::Text, s.text, "", 0});
+    out.push_back(std::move(m));
   }
+
+  Message paid;
+  paid.kind = MsgKind::Paid;
+  paid.user = "五条悟";
+  paid.amount = "CN¥30.0";
+  out.push_back(paid);
+
+  Message paid2;
+  paid2.kind = MsgKind::Paid;
+  paid2.user = "ディオ・ブランドー";
+  paid2.amount = "CN¥50.0";
+  out.push_back(paid2);
+
+  Message sub;
+  sub.kind = MsgKind::Membership;
+  sub.user = "xfgryujk";
+  sub.amount = "新会员";
+  out.push_back(sub);
+
+  Message after;
+  after.user = "友好的益生菌";
+  after.parts.emplace_back(Fragment{Fragment::Kind::Text, "弹幕姬启动", "", 0});
+  out.push_back(after);
+  return out;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string room, cookie, cookieFile, node = "pw-live-danmaku", desc = "Live Chat";
-  std::string dump;
-  int width = 480, height = 900, fps = 30, count = 0, seconds = 0;
-  bool verbose = false;
-
+  Options o;
   try {
-    switch (parseArgs(argc, argv, room, cookie, cookieFile, node, desc, width, height, fps, dump,
-                      count, seconds, verbose)) {
+    switch (parseArgs(argc, argv, o)) {
       case Args::Help: return 0;
       case Args::Error: return 2;
       case Args::Ok: break;
@@ -358,118 +389,173 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  if (room.empty()) {
-    std::fprintf(stderr, "--room is required (see --help)\n");
+  if (o.room.empty() && !o.demo) {
+    std::fprintf(stderr, "--room is required, or --demo for the offline layout\n");
     return 2;
   }
-  if (!cookie.empty() && !cookieFile.empty()) {
+  if (!o.cookie.empty() && !o.cookieFile.empty()) {
     std::fprintf(stderr, "--cookie and --cookie-file are mutually exclusive\n");
     return 2;
   }
-  if (!cookie.empty()) {
-    // Not a refusal: the value is genuinely useful on a machine where writing a secret file is
-    // awkward. The warning is about visibility to other processes, which the file option avoids.
+  if (!o.cookie.empty()) {
+    // Not a refusal: the value is genuinely useful where writing a secret file is awkward. The
+    // warning is about visibility to other processes, which the file option avoids.
     std::fprintf(stderr,
                  "warning: --cookie puts the session in the process arguments, where any local user\n"
                  "         can read it from ps(1). Prefer --cookie-file with a chmod 600 file.\n");
   }
-  if (!cookieFile.empty()) {
-    std::FILE* f = std::fopen(cookieFile.c_str(), "rb");
+  if (!o.cookieFile.empty()) {
+    std::FILE* f = std::fopen(o.cookieFile.c_str(), "rb");
     if (!f) {
-      std::fprintf(stderr, "cannot read cookie file: %s\n", cookieFile.c_str());
+      std::fprintf(stderr, "cannot read cookie file: %s\n", o.cookieFile.c_str());
       return 1;
     }
     char buf[8192];
     const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
     std::fclose(f);
     buf[n] = '\0';
-    cookie = buf;
+    o.cookie = buf;
     // A text file usually ends in a newline; it would otherwise become part of the header value.
-    while (!cookie.empty() && (cookie.back() == '\n' || cookie.back() == '\r')) cookie.pop_back();
+    while (!o.cookie.empty() && (o.cookie.back() == '\n' || o.cookie.back() == '\r'))
+      o.cookie.pop_back();
   }
 
   BiliConfig cfg;
-  cfg.cookie = cookie;
+  cfg.cookie = o.cookie;
   Bili bili(cfg);
 
+  PanelTokens tokens = defaultTokens();
+  if (!o.font.empty()) tokens.font = o.font;
+
   Shared sh;
-  sh.live.roomLabel = room;
-  pwvideo::CairoFrame frame(width, height);
+  sh.roomLabel = o.demo ? std::string("demo") : o.room;
+  AvatarStore avatars(96, bili.userAgent());
+  Panel panel(tokens);
+  panel.setAvatarStore(&avatars);
+  panel.resize(o.width, o.height);
+  pwvideo::CairoFrame frame(o.width, o.height);
+
+  // Reused across frames so the render path does not allocate.
+  std::vector<Message> fresh;
+
+  auto drawOnce = [&](int64_t now) {
+    drain(sh, fresh);
+    panel.update(fresh, now);
+    panel.render(frame.cr(), now);
+  };
+
+  /** Renders a short run and leaves the settled state in the frame.
+   *
+   *  The entrance animation lasts --animMs, so a single frame taken at the instant a message lands
+   *  samples it at alpha 0 and shows nothing at all. A viewer never sees that; they see the row
+   *  after the fade. This is the same reasoning the sibling project applies to its own stateful
+   *  effects: advance the clock past the transient and keep the last frame. */
+  auto settleForDump = [&](int frames = 12) {
+    const int64_t t0 = steadyMs();
+    for (int i = 0; i < frames; ++i) panel.render(frame.cr(), t0 + (i + 1) * 33);
+  };
+
+  if (o.demo) {
+    // Everything is known up front, so paint the list in one go rather than row by row.
+    sh.setState("demo (no network)");
+    panel.rebuildLayer(demoMessages());
+    if (!o.dump.empty()) {
+      panel.render(frame.cr(), steadyMs());
+      settleForDump();
+      if (!frame.writePng(o.dump)) {
+        std::fprintf(stderr, "PNG write failed: %s\n", o.dump.c_str());
+        return 1;
+      }
+      std::printf("Wrote %s (%dx%d)\n", o.dump.c_str(), o.width, o.height);
+      return 0;
+    }
+  }
+
   std::atomic<bool> stop{false};
   std::atomic<int> received{0};
 
-  // --dump renders one sample frame and exits, so it must not start a PipeWire node at all: with
-  // no consumer attached the render callback is never invoked, and the PNG would come out blank.
-  if (!dump.empty()) {
-    std::thread site(siteLoop, std::ref(sh), std::ref(bili), room, verbose, std::ref(stop),
-                     static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received), count);
-    // Bounded: --dump must terminate even in a quiet room, so it gives up rather than hanging.
-    const int64_t until = steadyMs() + 90000;
-    while (!stop.load() && received.load() == 0 && steadyMs() < until)
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    stop.store(true);
-    site.join();
+  if (o.dump.empty()) {
+    try {
+      pwvideo::Options opt;
+      opt.width = o.width;
+      opt.height = o.height;
+      opt.fpsCap = o.fps;
+      opt.nodeName = o.node;
+      opt.nodeDescription = o.desc;
+      opt.appName = "pw-live-danmaku";
+      opt.verbose = o.verbose;
 
-    drawDiagnostic(frame.cr(), sh.snapshot(), frame.width());
-    if (!frame.writePng(dump)) {
-      std::fprintf(stderr, "PNG write failed: %s\n", dump.c_str());
+      pwvideo::VideoNode video(opt, [&](uint8_t* dst, int stride, int w, int h) {
+        drawOnce(steadyMs());
+        // The negotiated w/h may be smaller than the frame; blitTo clips, which is why the OBS
+        // source size has to match --size rather than being free to differ.
+        frame.blitTo(dst, stride, w, h);
+      });
+      video.start();
+
+      std::printf(
+          "pw-live-danmaku (native) started\n"
+          "  PipeWire node: %s   [select it as a \"PipeWire Video\" source in OBS]\n"
+          "  Size: %dx%d @ %d fps\n",
+          o.node.c_str(), o.width, o.height, o.fps);
+      if (o.demo)
+        std::printf("  Mode:  demo (no network)\n");
+      else
+        std::printf("  Room:  %s\n  Auth:  %s\n", o.room.c_str(),
+                    o.cookie.empty() ? "anonymous (nicknames masked)" : "cookie");
+      std::fflush(stdout);
+
+      std::thread avatarThread([&avatars] { avatars.runWorker(); });
+
+      std::thread site;
+      if (!o.demo) {
+        site = std::thread(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), o.room,
+                           o.verbose, std::ref(stop), &video, std::ref(received), o.count);
+      }
+
+      std::thread killer;
+      if (o.seconds > 0) {
+        killer = std::thread([&] {
+          const int64_t until = steadyMs() + static_cast<int64_t>(o.seconds) * 1000LL;
+          while (!stop.load() && steadyMs() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          if (!stop.load()) {
+            std::fprintf(stderr, "[site] reached --seconds %d\n", o.seconds);
+            stop.store(true);
+            video.quit();
+          }
+        });
+      }
+      video.run();  // Blocks until SIGINT/SIGTERM, --count, --seconds, or the site loop gives up
+      stop.store(true);
+      if (site.joinable()) site.join();
+      avatars.stop();
+      if (avatarThread.joinable()) avatarThread.join();
+      if (killer.joinable()) killer.join();
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "startup failed: %s\n", e.what());
       return 1;
     }
-    std::printf("Wrote %s (%dx%d), received %d danmaku\n", dump.c_str(), width, height,
-                received.load());
-    return 0;
   }
 
-  try {
-    pwvideo::Options opt;
-    opt.width = width;
-    opt.height = height;
-    opt.fpsCap = fps;
-    opt.nodeName = node;
-    opt.nodeDescription = desc;
-    opt.appName = "pw-live-danmaku";
-    opt.verbose = verbose;
-
-    pwvideo::VideoNode video(opt, [&](uint8_t* dst, int stride, int w, int h) {
-      // The negotiated w/h may be smaller than the frame; blitTo clips, which is why the OBS
-      // source size has to match --size rather than be free to differ.
-      drawDiagnostic(frame.cr(), sh.snapshot(), frame.width());
-      frame.blitTo(dst, stride, w, h);
-    });
-    video.start();
-
-    std::printf(
-        "pw-live-danmaku (native) started\n"
-        "  PipeWire node: %s   [select it as a \"PipeWire Video\" source in OBS]\n"
-        "  Size: %dx%d @ %d fps\n"
-        "  Room: %s\n",
-        node.c_str(), width, height, fps, room.c_str());
-    std::printf("  Auth:  %s\n", cookie.empty() ? "anonymous (nicknames masked)" : "cookie");
-    std::fflush(stdout);
-
-    std::thread site(siteLoop, std::ref(sh), std::ref(bili), room, verbose, std::ref(stop),
-                     &video, std::ref(received), count);
-
-    std::thread killer;
-    if (seconds > 0) {
-      killer = std::thread([&] {
-        const int64_t until = steadyMs() + static_cast<int64_t>(seconds) * 1000LL;
-        while (!stop.load() && steadyMs() < until)
-          std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (!stop.load()) {
-          std::fprintf(stderr, "[site] reached --seconds %d\n", seconds);
-          stop.store(true);
-          video.quit();
-        }
-      });
-    }
-    video.run();  // Blocks until SIGINT/SIGTERM, --count, --seconds, or the site loop gives up
-    stop.store(true);
-    if (site.joinable()) site.join();
-    if (killer.joinable()) killer.join();
-    return 0;
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "startup failed: %s\n", e.what());
+  // --dump against a live room: no PipeWire node at all, because with no consumer attached the
+  // render callback is never invoked and the PNG would come out blank.
+  std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), o.room, o.verbose,
+                   std::ref(stop), static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received),
+                   o.count);
+  const int64_t until = steadyMs() + 90000;
+  while (!stop.load() && received.load() == 0 && steadyMs() < until)
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  stop.store(true);
+  site.join();
+  drawOnce(steadyMs());
+  settleForDump();
+  if (!frame.writePng(o.dump)) {
+    std::fprintf(stderr, "PNG write failed: %s\n", o.dump.c_str());
     return 1;
   }
+  std::printf("Wrote %s (%dx%d), received %d messages\n", o.dump.c_str(), o.width, o.height,
+              received.load());
+  return 0;
 }

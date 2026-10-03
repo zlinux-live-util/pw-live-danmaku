@@ -17,6 +17,7 @@
 #include <string_view>
 
 #include "json.hpp"
+#include "message.hpp"
 
 namespace dwm {
 
@@ -35,19 +36,6 @@ struct DanmuEndpoint {
   std::string host;
   int wssPort = 2245;
   std::string token;
-};
-
-/** One DANMU_MSG, reduced to the fields a renderer needs. Field meanings for mode / dm_type are
- *  not yet pinned down by measurement and are carried through untyped. */
-struct Danmaku {
-  std::string cmd;
-  std::string text;
-  std::string user;         // masked ("abc***") unless the connection carries a login cookie
-  int64_t timestampMs = 0;
-  uint32_t color = 0xFFFFFF;
-  int fontSize = 25;
-  int mode = 0;
-  int dmType = 0;
 };
 
 /** Compression applied to a packet body, taken from the header's proto field. */
@@ -126,9 +114,20 @@ class Bili {
   static bool decompress(uint16_t proto, std::string_view body, std::string& out,
                          size_t maxOut = 64u * 1024u * 1024u);
 
-  /** Parses one DANMU_MSG JSON object. Returns false for any other cmd, which is not an error:
-   *  the stream carries membership, gift and system events alongside the chat. */
-  static bool parseDanmaku(const Json& json, Danmaku& out);
+  /** Turns one command document into a Message. Returns false for anything that is not a message
+   *  meant for the chat panel, which is most of the stream: entry notices, rank changes, gift and
+   *  membership events this milestone does not render yet. That is not an error.
+   *
+   *  DANMU_MSG is measured and verified; see docs/internals.md. The card kinds are read from the
+   *  documented field tables but have not yet been observed on this machine, so every field there
+   *  is optional and a document that does not match simply produces a message with less in it
+   *  rather than being dropped. */
+  static bool parseMessage(const Json& json, Message& out);
+
+  /** Splits a body into text and emote fragments using the platform's advertised token map. */
+  static void splitFragments(const std::string& text,
+                             const std::vector<std::pair<std::string, Fragment>>& emotes,
+                             std::vector<Fragment>& out);
 
   // Exposed for the tests and for docs/internals.md; not used by the render path.
   static std::string mixinKey(const std::string& imgKey, const std::string& subKey);
