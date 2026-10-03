@@ -23,7 +23,11 @@ namespace dwm {
 
 class AvatarStore {
  public:
-  explicit AvatarStore(int size, std::string userAgent);
+  /** pixelSize is the box the fetched image is decoded and cropped to; capacity is how many are
+   *  kept. They are separate because conflating them is how the first version of this ended up
+   *  decoding every face at whatever the LRU limit happened to be and then showing its top-left
+   *  corner: a 96x96 surface clipped into a 24px circle does not show the whole avatar. */
+  AvatarStore(int pixelSize, size_t capacity, std::string userAgent);
   ~AvatarStore();
 
   /** Records a URL as wanted. Safe from the site thread; does nothing if already known or pending. */
@@ -43,6 +47,10 @@ class AvatarStore {
   size_t cached() const;
   uint64_t fetched() const;
   uint64_t failed() const;
+  /** Description of the most recent failure, empty when the last fetch succeeded. The AssetCache
+   *  does not report why a fetch failed, so this is captured from the fetcher's own counters plus
+   *  the URL, which is enough to tell "no avatar for this user" from "the CDN refused us". */
+  std::string lastError() const;
 
  private:
   struct Slot {
@@ -51,6 +59,7 @@ class AvatarStore {
   };
 
   int size_;
+  size_t capacity_;
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::string> queue_;
@@ -62,6 +71,7 @@ class AvatarStore {
   mutable std::unordered_map<std::string, Slot> cache_;
   mutable uint64_t clock_ = 0;
   bool stop_ = false;
+  mutable std::string lastError_;
   std::unique_ptr<pwvideo::AssetCache> fetcher_;
 };
 

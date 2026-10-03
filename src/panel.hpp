@@ -126,10 +126,15 @@ class Panel {
  private:
   double measureRow(const Message& m, cairo_t* cr, bool* isCard) const;
   double paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const;
-  /** Moves the accumulated picture up by h and paints m into the strip that opens at the bottom.
-   *  Row bookkeeping belongs to the caller. */
+  /** Moves the accumulated picture up by h and clears the strip that opens at the bottom, without
+   *  painting into it. The newest message reserves its slot through this, so the rows below it move
+   *  up on the frame it arrives rather than when its animation ends. */
+  void reserveBand(double h);
+  /** reserveBand followed by painting m into the strip it opened, for a row that is already settled
+   *  and needs no animation. Row bookkeeping belongs to the caller. */
   void shiftAndPaint(const Message& m, double h);
-  /** Folds a finished entrance animation into the static layer. */
+  /** Fills the reserved strip with the row that has finished fading in. No shift: the strip was
+   *  reserved on arrival, and shifting again would move the list a second time. */
   void bakeAnimating();
   /** Drops rows that have scrolled out of the panel, so the vector cannot grow without bound. */
   void prune();

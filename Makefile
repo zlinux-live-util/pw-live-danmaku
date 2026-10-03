@@ -35,7 +35,7 @@ endif
 # systemd user service: the unit is a template; @REPO@ / @ARGS@ are substituted at install time
 UNIT         := pw-live-danmaku.service
 UNIT_DIR     ?= $(HOME)/.config/systemd/user
-SERVICE_ARGS ?= --room 545068 --node pw-live-danmaku --size 480x900 --fps 30
+SERVICE_ARGS ?= --room 545068 --node pw-live-danmaku --size 480x1080 --fps 30
 
 .PHONY: all clean run install-service uninstall-service compile-commands test
 

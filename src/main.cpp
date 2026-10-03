@@ -53,6 +53,10 @@ constexpr size_t kMaxPerFrame = 40;
  *  would accumulate every message that arrived. */
 constexpr size_t kPendingCap = 400;
 
+/** How many messages --dump waits for when --count was not given: enough for the panel to show
+ *  something worth looking at, few enough to stay quick. */
+constexpr int kDumpMessages = 6;
+
 PanelTokens defaultTokens() {
   PanelTokens t;
   t.font = kFontChain;
@@ -78,7 +82,7 @@ void usage(std::FILE* out) {
       "  --node NAME        PipeWire node name, default pw-live-danmaku\n"
       "  --desc TEXT        Node description (this is what the OBS dropdown shows), default\n"
       "                     \"Live Chat\"\n"
-      "  --size WxH         Output size, default 480x900. The OBS source size must match:\n"
+      "  --size WxH         Output size, default 480x1080. The OBS source size must match:\n"
       "                     a smaller negotiated size is clipped, not scaled.\n"
       "  --fps N            Frame-rate ceiling, default 30\n"
       "  --dump FILE        Render one sample frame to PNG and exit\n"
@@ -100,7 +104,7 @@ struct Options {
   std::string dump;
   std::vector<std::string> fontFiles;
   std::string font;
-  int width = 480, height = 900, fps = 30, count = 0, seconds = 0;
+  int width = 480, height = 1080, fps = 30, count = 0, seconds = 0;
   bool verbose = false, demo = false;
 };
 
@@ -224,7 +228,13 @@ void siteLoop(Shared& sh, Bili& bili, AvatarStore& avatars, const std::string& r
     sh.setState("connecting");
     ws.connect(opt);
     sh.setState("authenticating");
-    if (!ws.sendBinary(Bili::authPacket(roomId, ep.token))) {
+    // The account mid comes from the cookie's DedeUserID. Sending 0 authenticates as a guest,
+    // which connects fine but is exactly why nicknames arrive masked.
+    const int64_t mid = bili.accountMid();
+    if (verbose)
+      std::fprintf(stderr, "[site] uid=%lld (%s)\n", static_cast<long long>(mid),
+                   mid ? "authenticated" : "guest");
+    if (!ws.sendBinary(Bili::authPacket(roomId, ep.token, mid))) {
       sh.setState("auth send failed: " + ws.lastError());
       return;
     }
@@ -429,7 +439,10 @@ int main(int argc, char** argv) {
 
   Shared sh;
   sh.roomLabel = o.demo ? std::string("demo") : o.room;
-  AvatarStore avatars(96, bili.userAgent());
+  // 48 px decoded into a 24 px box, so the face stays crisp on a hidpi canvas without storing four
+  // times the pixels it needs. The capacity is separate and only bounds memory: a busy room shows
+  // roughly 36 rows, and a visible row's avatar has to outlive the messages that push it off.
+  AvatarStore avatars(48, 256, bili.userAgent());
   Panel panel(tokens);
   panel.setAvatarStore(&avatars);
   panel.resize(o.width, o.height);
@@ -526,11 +539,32 @@ int main(int argc, char** argv) {
           }
         });
       }
+
+      // Avatar bookkeeping is invisible from the picture: a message whose avatar has not arrived
+      // yet looks exactly like one whose user has no picture. --verbose prints the counters and the
+      // last failing URL so the two can be told apart.
+      std::thread stats;
+      if (o.verbose) {
+        stats = std::thread([&] {
+          while (!stop.load()) {
+            for (int i = 0; i < 10 && !stop.load(); ++i)
+              std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (stop.load()) break;
+            const std::string err = avatars.lastError();
+            std::fprintf(stderr, "[avatar] cached=%zu pending=%zu fetched=%llu failed=%llu%s%s\n",
+                         avatars.cached(), avatars.pending(),
+                         static_cast<unsigned long long>(avatars.fetched()),
+                         static_cast<unsigned long long>(avatars.failed()),
+                         err.empty() ? "" : "  last-fail: ", err.c_str());
+          }
+        });
+      }
       video.run();  // Blocks until SIGINT/SIGTERM, --count, --seconds, or the site loop gives up
       stop.store(true);
       if (site.joinable()) site.join();
       avatars.stop();
       if (avatarThread.joinable()) avatarThread.join();
+      if (stats.joinable()) stats.join();
       if (killer.joinable()) killer.join();
       return 0;
     } catch (const std::exception& e) {
@@ -540,15 +574,31 @@ int main(int argc, char** argv) {
   }
 
   // --dump against a live room: no PipeWire node at all, because with no consumer attached the
-  // render callback is never invoked and the PNG would come out blank.
+  // render callback is never invoked and the PNG would come out blank. The avatar worker runs here
+  // too, so the dump shows real faces instead of placeholder discs -- which is what makes it useful
+  // for judging a layout rather than only for reading the connection state.
+  std::thread avatarThread([&avatars] { avatars.runWorker(); });
   std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), o.room, o.verbose,
                    std::ref(stop), static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received),
-                   o.count);
+                   o.count > 0 ? o.count : kDumpMessages);
   const int64_t until = steadyMs() + 90000;
-  while (!stop.load() && received.load() == 0 && steadyMs() < until)
+  // Wait for a few messages rather than just the first: one row is not enough to judge a layout,
+  // and a panel with real avatars in it needs more than one row to show them.
+  const int want = o.count > 0 ? o.count : kDumpMessages;
+  while (!stop.load() && received.load() < want && steadyMs() < until)
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   stop.store(true);
   site.join();
+  // Bounded wait for the fetches already queued; a slow CDN must not hang the dump. The condition is
+  // "there is still a backlog", not "nothing has arrived yet" -- the latter returns after the
+  // first avatar and leaves the rest as placeholder discs.
+  const int64_t avatarUntil = steadyMs() + 8000;
+  while (avatars.pending() > 0 && steadyMs() < avatarUntil)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  avatars.stop();
+  if (avatarThread.joinable()) avatarThread.join();
+  // pending() clears when the worker picks a URL up, so allow the last in-flight one to land.
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
   drawOnce(steadyMs());
   settleForDump();
   if (!frame.writePng(o.dump)) {

@@ -7,7 +7,8 @@
 
 namespace dwm {
 
-AvatarStore::AvatarStore(int size, std::string userAgent) : size_(std::max(1, size)) {
+AvatarStore::AvatarStore(int pixelSize, size_t capacity, std::string userAgent)
+    : size_(std::max(1, pixelSize)), capacity_(std::max<size_t>(1, capacity)) {
   pwvideo::AssetCache::Options opt;
   // The fetcher keeps its own small cache purely to reuse the connection; this class decides what
   // stays, because it also has to know what to evict.
@@ -53,6 +54,11 @@ size_t AvatarStore::cached() const {
 uint64_t AvatarStore::fetched() const { return fetcher_->fetched(); }
 uint64_t AvatarStore::failed() const { return fetcher_->failed(); }
 
+std::string AvatarStore::lastError() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return lastError_;
+}
+
 void AvatarStore::runWorker() {
   for (;;) {
     std::string url;
@@ -70,13 +76,14 @@ void AvatarStore::runWorker() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!surf) {
       pendingUrls_.erase(url);  // failed: allow a later message to try again
+      lastError_ = url;
       continue;
     }
     cache_[url] = Slot{std::move(surf), ++clock_};
 
     // Evict the least recently used entry. Dropping a surface here can run cairo's finaliser, so
     // it happens under the lock but on a surface nobody is holding a reference to.
-    while (static_cast<int>(cache_.size()) > size_) {
+    while (cache_.size() > capacity_) {
       auto oldest = cache_.begin();
       for (auto it = cache_.begin(); it != cache_.end(); ++it) {
         if (it->second.used < oldest->second.used) oldest = it;

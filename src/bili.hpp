@@ -83,11 +83,22 @@ class Bili {
   const std::string& userAgent() const { return cfg_.userAgent; }
 
   /** buvid3 + the user's cookie, as a Cookie header value. Public because the websocket
-   *  handshake needs the same cookies the HTTP bootstrap used. Never logged. */
+   *  handshake needs the same cookies the HTTP bootstrap used. Never logged. The own buvid3 is
+   *  only added when the user's cookie does not already carry one, so the header never ends up
+   *  with two of them. */
   const std::string& cookieHeader() const;
 
-  /** The 16-byte-header packet that authenticates the connection. */
-  static std::string authPacket(int64_t realRoomId, const std::string& token);
+  /** The account mid taken from DedeUserID in the user's cookie, or 0 when absent. Sent as the
+   *  authentication packet's uid so the connection is authenticated rather than a guest's, which
+   *  is what decides whether nicknames are masked. Parsed on first call, not on first
+   *  cookieHeader(), so it does not depend on those happening in a particular order. */
+  int64_t accountMid() const;
+
+  /** The 16-byte-header packet that authenticates the connection.
+   *
+   *  uid must match the account whose credentials fetched the token, or the server drops the
+   *  connection; 0 means "guest", which still works but is why nicknames arrive masked. */
+  static std::string authPacket(int64_t realRoomId, const std::string& token, int64_t uid = 0);
   /** Heartbeat packet. The body is a placeholder: the server only checks that one arrived. */
   static std::string heartbeatPacket();
 
@@ -148,6 +159,8 @@ class Bili {
   const std::string& wbiMixinKey() const;
 
   BiliConfig cfg_;
+  mutable int64_t mid_ = 0;
+  mutable bool midParsed_ = false;
   mutable std::string buvid_;
   mutable std::string mixinKey_;
   mutable std::string cookie_;

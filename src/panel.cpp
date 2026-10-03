@@ -118,14 +118,27 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
 void Panel::drawAvatar(cairo_t* cr, const Message& m, double cx, double cy, double d) const {
   const double r = d / 2.0;
   cairo_save(cr);
-  // Circular clip, so a square avatar is trimmed to a disc.
+  // Circular clip, so a square avatar is trimmed to a disc. Set before the transform below, so it
+  // stays in the panel's coordinates.
   cairo_arc(cr, cx, cy, r, 0.0, 2.0 * kPi);
   cairo_clip(cr);
 
   pwvideo::SurfacePtr surf;
   if (avatars_) surf = avatars_->lookup(m.avatarUrl);
   if (surf) {
-    cairo_set_source_surface(cr, surf.get(), cx - r, cy - r);
+    // Scale the picture into the box instead of assuming it is already the right size. cairo
+    // anchors a source surface at its top-left corner, so a surface larger than the box would be
+    // clipped down to that corner -- which is exactly how an avatar ends up showing one small square
+    // of itself rather than the whole face.
+    const int sw = cairo_image_surface_get_width(surf.get());
+    const int sh = cairo_image_surface_get_height(surf.get());
+    if (sw > 0 && sh > 0) {
+      cairo_translate(cr, cx - r, cy - r);
+      cairo_scale(cr, d / static_cast<double>(sw), d / static_cast<double>(sh));
+      cairo_set_source_surface(cr, surf.get(), 0.0, 0.0);
+    } else {
+      cairo_set_source_rgba(cr, 0.55, 0.58, 0.62, 1.0);
+    }
   } else {
     // Placeholder disc. Bilibili hands out face URLs without a login, so a miss is normally
     // "not fetched yet" rather than "not available".
@@ -239,8 +252,10 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   return ty - y;
 }
 
-/** Moves the accumulated picture up by h and paints m into the strip that opens at the bottom. */
-void Panel::shiftAndPaint(const Message& m, double h) {
+/** Moves the accumulated picture up by h and clears the strip that opens at the bottom, without
+ *  painting anything into it. The strip stays empty until the caller fills it, which is what lets
+ *  the newest message reserve its slot the instant it arrives rather than 200 ms later. */
+void Panel::reserveBand(double h) {
   if (!layer_ || !layerCr_ || h <= 0.0) return;
   cairo_t* lc = layerCr_.get();
   // Painting the surface onto itself one row up is a self-overlapping blit; pixman resolves the
@@ -248,12 +263,18 @@ void Panel::shiftAndPaint(const Message& m, double h) {
   cairo_set_operator(lc, CAIRO_OPERATOR_SOURCE);
   cairo_set_source_surface(lc, layer_.get(), 0.0, -h);
   cairo_paint(lc);
-  // The strip exposed at the bottom is stale; clear it before drawing into it.
   cairo_set_source_rgba(lc, 0, 0, 0, 0);
   cairo_rectangle(lc, 0, height_ - h, width_, h);
   cairo_fill(lc);
   cairo_set_operator(lc, CAIRO_OPERATOR_OVER);
-  paintRow(lc, m, 0.0, height_ - h, static_cast<double>(width_));
+}
+
+/** reserveBand followed by painting m into the strip it opened, for a row that is already settled
+ *  and does not need animating. */
+void Panel::shiftAndPaint(const Message& m, double h) {
+  if (h <= 0.0) return;
+  reserveBand(h);
+  paintRow(layerCr_.get(), m, 0.0, height_ - h, static_cast<double>(width_));
 }
 
 /** Paints a whole list at once. Used for --demo and after a reset, where every message is known up
@@ -282,11 +303,12 @@ void Panel::rebuildLayer(const std::vector<Message>& msgs) {
   }
 }
 
-/** Folds a finished entrance animation into the static layer. The row was already counted when it
- *  was held out, so this only moves its pixels; it must not add a row. */
+/** Settles the row that was fading in. The slot was already reserved when it arrived, so this only
+ *  fills it; there is deliberately no shift here, or the rest of the list would jump a second
+ *  time. The row was counted when it was held out, so this adds no bookkeeping. */
 void Panel::bakeAnimating() {
-  if (!animating_) return;
-  shiftAndPaint(anim_, animRowH_);
+  if (!animating_ || !layer_ || !layerCr_) return;
+  paintRow(layerCr_.get(), anim_, 0.0, height_ - animRowH_, static_cast<double>(width_));
   animating_ = false;
   animRowH_ = 0.0;
   anim_ = Message();
@@ -317,10 +339,13 @@ bool Panel::update(const std::vector<Message>& fresh, int64_t nowMs) {
     contentH_ += h;
   }
 
-  // The newest message is held out of the layer so it can fade in.
+  // The newest message reserves its slot immediately -- the existing rows move up on the very frame
+  // it arrives, not when its animation ends -- and is held out of the layer only so render() can
+  // play the slide-in into that reserved strip.
   const Message& last = fresh.back();
   bool card = false;
   const double h = measureRow(last, lc, &card);
+  reserveBand(h);
   rows_.push_back(Row{count_++, contentH_, h, card});
   contentH_ += h;
   anim_ = last;

@@ -244,16 +244,38 @@ const std::string& Bili::wbiMixinKey() const {
 
 const std::string& Bili::cookieHeader() const {
   if (cookieBuilt_) return cookie_;
-  // buvid3 and b_nut are the pair a fresh browser would already carry. The user cookie, when given,
-  // is appended rather than replacing them, because the API wants both.
-  std::string c = "buvid3=" + buvid() + "; b_nut=" + std::to_string(::time(nullptr));
-  if (!cfg_.cookie.empty()) {
-    c += "; ";
-    c += cfg_.cookie;
+  std::string c;
+  // Only supply our own device id when the user's cookie does not already carry one. Two buvid3
+  // values in a single Cookie header is at best ambiguous, and fetching one is a network request we
+  // can skip when it is already there.
+  if (cfg_.cookie.find("buvid3=") == std::string::npos) {
+    c = "buvid3=" + buvid() + "; b_nut=" + std::to_string(::time(nullptr)) + "; ";
   }
+  c += cfg_.cookie;
   cookie_ = std::move(c);
   cookieBuilt_ = true;
   return cookie_;
+}
+
+int64_t Bili::accountMid() const {
+  if (!midParsed_) {
+    // DedeUserID is the account mid. Anything non-numeric or absent leaves it 0, which sends the
+    // connection as a guest -- the same behaviour as having no cookie at all, so a malformed
+    // cookie degrades instead of dropping the connection.
+    static const char* kKey = "DedeUserID=";
+    const size_t at = cfg_.cookie.find(kKey);
+    if (at != std::string::npos) {
+      int64_t v = 0;
+      for (size_t i = at + std::strlen(kKey); i < cfg_.cookie.size(); ++i) {
+        const char ch = cfg_.cookie[i];
+        if (ch < '0' || ch > '9') break;
+        v = v * 10 + (ch - '0');
+      }
+      mid_ = v;
+    }
+    midParsed_ = true;
+  }
+  return mid_;
 }
 
 std::string Bili::get(const std::string& url, size_t maxBytes) const {
@@ -349,12 +371,17 @@ DanmuEndpoint Bili::danmuEndpoint(int64_t realRoomId) {
   return ep;
 }
 
-std::string Bili::authPacket(int64_t realRoomId, const std::string& token) {
+std::string Bili::authPacket(int64_t realRoomId, const std::string& token, int64_t uid) {
   // Body is JSON. The protobuf ClientVerifyReq that most open-source clients send is answered by
   // an immediate disconnect; see docs/internals.md for the variants that were tried.
+  //
+  // uid is the account mid and must match the credentials that fetched the token, or the server
+  // drops the connection. 0 is the guest path: it works, but the server then masks every nickname.
   char buf[64];
   std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(realRoomId));
-  std::string body = "{\"uid\":0,\"roomid\":";
+  std::string body = "{\"uid\":";
+  body += std::to_string(uid);
+  body += ",\"roomid\":";
   body += buf;
   body += ",\"protover\":3,\"platform\":\"web\",\"type\":2,\"key\":\"";
   body += token;
