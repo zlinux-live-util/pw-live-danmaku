@@ -1,5 +1,5 @@
 #pragma once
-// Avatar cache that the render callback may read without ever blocking.
+// Image cache that the render callback may read without ever blocking.
 //
 // The submodule's AssetCache does the fetching and decoding, but its get() blocks on the network.
 // Calling that from a frame callback would stall the PipeWire graph, so the split is:
@@ -21,14 +21,14 @@
 
 namespace dwm {
 
-class AvatarStore {
+class ImageStore {
  public:
   /** pixelSize is the box the fetched image is decoded and cropped to; capacity is how many are
    *  kept. They are separate because conflating them is how the first version of this ended up
    *  decoding every face at whatever the LRU limit happened to be and then showing its top-left
    *  corner: a 96x96 surface clipped into a 24px circle does not show the whole avatar. */
-  AvatarStore(int pixelSize, size_t capacity, std::string userAgent);
-  ~AvatarStore();
+  ImageStore(int pixelSize, size_t capacity, std::string userAgent);
+  ~ImageStore();
 
   /** Records a URL as wanted. Safe from the site thread; does nothing if already known or pending. */
   void request(const std::string& url);

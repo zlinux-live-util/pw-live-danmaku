@@ -23,7 +23,7 @@
 
 #include <cairo/cairo.h>
 
-#include "avatars.hpp"
+#include "images.hpp"
 #include "cairo_util.hpp"
 #include "message.hpp"
 #include "text.hpp"
@@ -34,6 +34,7 @@ namespace dwm {
 struct PanelTokens {
   double avatar = 24.0;      // --avatar-size
   double avatarGap = 10.0;   // avatar margin-right
+  double emote = 24.0;       // --emote-size; inline emotes are drawn at this box
   double fontUser = 20.0;    // --username-size
   double fontBody = 20.0;    // --text-content-size
   double fontCardName = 22.0;   // --paid-msg-line-1-size
@@ -98,8 +99,11 @@ class Panel {
   explicit Panel(PanelTokens tokens);
 
   void resize(int width, int height);
-  /** The avatar store is borrowed, not owned, and is read only through lookup(). */
-  void setAvatarStore(AvatarStore* store) { avatars_ = store; }
+  /** The image stores are borrowed, not owned, and are read only through lookup(). Avatars and emotes
+   *  are kept apart because they are fetched at different sizes and have very different reuse: one
+   *  face per viewer versus the same handful of emotes all evening. */
+  void setImageStore(ImageStore* store) { avatars_ = store; }
+  void setEmoteStore(ImageStore* store) { emotes_ = store; }
 
   /** Appends messages that arrived since the last call, and repaints only what changed. nowMs is the
    *  clock the entrance animation is timed against. Returns true when anything was redrawn.
@@ -148,12 +152,16 @@ class Panel {
   /** Paints the avatars for every row currently on screen. Separate from paintRow so that a face
    *  arriving after its row was laid out appears without the row having to be redrawn. */
   void drawAvatars(cairo_t* cr) const;
+  /** Draws one inline emote into a box on the current line, or the token as text when the picture
+   *  has not arrived yet or the platform gave no URL for it. */
+  void drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;
 
   PanelTokens tok_;
-  AvatarStore* avatars_ = nullptr;
+  ImageStore* avatars_ = nullptr;
+  ImageStore* emotes_ = nullptr;
 
   int width_ = 0;
   int height_ = 0;

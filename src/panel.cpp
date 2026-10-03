@@ -3,7 +3,6 @@
 #include "panel.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 #include <pango/pangocairo.h>
@@ -14,6 +13,37 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 
 double clamp01(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+
+/** U+FFFC OBJECT REPLACEMENT CHARACTER, as UTF-8. Stands in for an emote inside the string handed
+ *  to pango. */
+constexpr const char* kEmoteChar = "\xEF\xBF\xBC";
+constexpr size_t kEmoteCharLen = 3;
+
+/** A message body prepared for layout: the text runs joined, with every emote collapsed to one
+ *  object-replacement character, plus where each placeholder sits and which fragment it stands for.
+ *
+ *  Doing the substitution *before* layout means pango's own line breaking decides where the emotes
+ *  land. Wrapping the fragments by hand instead would mean reimplementing break opportunities for
+ *  mixed CJK and latin text, which is exactly the part that is hard to get right. The placeholder
+ *  itself is never drawn -- paintRow splits each line at it and puts the picture there. */
+struct InlineBody {
+  std::string text;
+  std::vector<std::pair<size_t, size_t>> emotes;  // (byte offset in text, index into parts)
+};
+
+InlineBody buildBody(const Message& m) {
+  InlineBody b;
+  for (size_t i = 0; i < m.parts.size(); ++i) {
+    const Fragment& f = m.parts[i];
+    if (f.kind == Fragment::Kind::Text) {
+      b.text += f.text;
+    } else {
+      b.emotes.emplace_back(b.text.size(), i);
+      b.text += kEmoteChar;
+    }
+  }
+  return b;
+}
 
 /** Card height, from arithmetic alone. Deliberately not measured with pango: paintRow needs the
  *  height while it already holds the single TextRenderer layout, and a nested layout call would
@@ -109,10 +139,13 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   spec.sizePx = tok_.fontBody;
   spec.widthPx = std::max(20.0, avail - nw);
   spec.maxLines = 8;
-  PangoLayout* l = text_.layout(cr, m.plainText(), spec);
+  // Count lines on the laid-out string, emotes included: a line of nothing but an emote still takes
+  // a line, and plainText() would measure a different string than the one actually drawn.
+  const InlineBody body = buildBody(m);
+  PangoLayout* l = text_.layout(cr, body.text, spec);
   const int lines = std::max(1, pango_layout_get_line_count(l));
-  const double body = static_cast<double>(lines) * tok_.fontBody * tok_.lineHeight;
-  return std::max(body, tok_.avatar) + tok_.rowGap;
+  const double textH = static_cast<double>(lines) * tok_.fontBody * tok_.lineHeight;
+  return std::max(textH, tok_.avatar) + tok_.rowGap;
 }
 
 void Panel::drawAvatar(cairo_t* cr, const std::string& url, double cx, double cy, double d) const {
@@ -173,6 +206,46 @@ void Panel::drawAvatars(cairo_t* cr) const {
     const double screenTop = static_cast<double>(height_) - (contentH_ - r.y);
     drawAvatar(cr, r.avatarUrl, cx, screenTop + tok_.avatar / 2.0, tok_.avatar);
   }
+}
+
+void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const {
+  const double d = tok_.emote;
+  const double y = lineTop + (lineH - d) / 2.0;
+
+  pwvideo::SurfacePtr surf;
+  if (emotes_ && !f.url.empty()) surf = emotes_->lookup(f.url);
+
+  if (!surf) {
+    // Not fetched yet, or the platform advertised a token with no picture. Either way the message
+    // still has to read, so the token is drawn as text in the same place the picture would be.
+    pwvideo::LabelSpec ls;
+    ls.family = tok_.font;
+    ls.center = false;
+    ls.bold = true;
+    ls.sizePx = tok_.fontBody;
+    ls.maxLines = 1;
+    const double ty = y + (d - tok_.fontBody * tok_.lineHeight) / 2.0;
+    PangoLayout* l = text_.layout(cr, f.text, ls);
+    pwvideo::TextRenderer::outline(cr, l, x, ty, tok_.outline, rgb(tok_.outlineColor, 0.85));
+    pwvideo::TextRenderer::fill(cr, l, x, ty, rgb(tok_.body));
+    return;
+  }
+
+  cairo_save(cr);
+  // Slightly rounded, the way the reference stylesheet's inline images sit in the text flow.
+  pwvideo::roundedRect(cr, x, y, d, d, 4.0);
+  cairo_clip(cr);
+  const int sw = cairo_image_surface_get_width(surf.get());
+  const int sh = cairo_image_surface_get_height(surf.get());
+  if (sw > 0 && sh > 0) {
+    cairo_translate(cr, x, y);
+    cairo_scale(cr, d / static_cast<double>(sw), d / static_cast<double>(sh));
+    cairo_set_source_surface(cr, surf.get(), 0.0, 0.0);
+  } else {
+    cairo_set_source_rgba(cr, 0.45, 0.45, 0.5, 1.0);
+  }
+  cairo_paint(cr);
+  cairo_restore(cr);
 }
 
 double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const {
@@ -243,20 +316,21 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   outlined(nl, textX, ty, rgb(nc));
 
   const double bodyX = textX + nw;
-  const std::string body = m.plainText();
+  // Emotes become object-replacement characters before layout, so pango does the line breaking and
+  // places the placeholders. Each visual line is then split back at them and drawn as text runs
+  // and pictures in a single pass.
+  const InlineBody body = buildBody(m);
   pwvideo::LabelSpec bs = spec;
   bs.sizePx = tok_.fontBody;
   bs.widthPx = std::max(20.0, avail - nw);  // the first line shares the row with the name
   bs.maxLines = 8;
-  PangoLayout* bl = text_.layout(cr, body, bs);
+  PangoLayout* bl = text_.layout(cr, body.text, bs);
 
-  // Each visual line is filled separately: that is what lets the name carry its own colour while
-  // the body still wraps at the right width and continues under itself rather than under the name.
   const int nLines = std::max(1, pango_layout_get_line_count(bl));
   const double lh = tok_.fontBody * tok_.lineHeight;
 
   // Collect the line boundaries before drawing anything. TextRenderer owns a single PangoLayout,
-  // so laying out a slice inside this loop rebinds that same layout and the line list being walked
+  // so laying out a run inside this loop rebinds that same layout and the line list being walked
   // would be replaced underfoot -- which is exactly how continuation lines went missing.
   std::vector<std::pair<size_t, size_t>> spans;
   spans.reserve(static_cast<size_t>(nLines));
@@ -264,17 +338,46 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     PangoLayoutLine* pl = pango_layout_get_line_readonly(bl, i);
     if (pl) spans.emplace_back(static_cast<size_t>(pl->start_index), static_cast<size_t>(pl->length));
   }
-  if (spans.empty()) spans.emplace_back(0, body.size());
+  if (spans.empty()) spans.emplace_back(0, body.text.size());
 
   for (const auto& span : spans) {
-    std::string slice = body.substr(span.first, span.second);
-    // Pango keeps the newline at the end of a line's text run.
-    while (!slice.empty() && (slice.back() == '\n' || slice.back() == '\r')) slice.pop_back();
-    if (!slice.empty()) {
+    // Pango keeps the newline at the end of a line's text run; drop it before measuring.
+    size_t len = span.second;
+    while (len > 0 && (body.text[span.first + len - 1] == '\n' ||
+                       body.text[span.first + len - 1] == '\r')) {
+      --len;
+    }
+    const size_t start = span.first;
+    const size_t end = start + len;
+
+    // Walk the line, alternating text runs and emotes, accumulating x by the measured width of
+    // each run. Positions come out consistent with the wrapping above because both used pango.
+    double x = bodyX;
+    size_t cursor = start;
+    for (const auto& em : body.emotes) {
+      if (em.first < start) continue;
+      if (em.first >= end) break;
+      if (em.first > cursor) {
+        const std::string run = body.text.substr(cursor, em.first - cursor);
+        pwvideo::LabelSpec ls = spec;
+        ls.sizePx = tok_.fontBody;
+        ls.maxLines = 1;
+        PangoLayout* rl = text_.layout(cr, run, ls);
+        int rw = 0, rh = 0;
+        pango_layout_get_pixel_size(rl, &rw, &rh);
+        outlined(rl, x, ty, rgb(tok_.body));
+        x += rw;
+      }
+      drawEmote(cr, m.parts[em.second], x, ty, lh);
+      x += tok_.emote;
+      cursor = em.first + kEmoteCharLen;  // step over the placeholder itself
+    }
+    if (cursor < end) {
+      const std::string run = body.text.substr(cursor, end - cursor);
       pwvideo::LabelSpec ls = spec;
       ls.sizePx = tok_.fontBody;
       ls.maxLines = 1;
-      outlined(text_.layout(cr, slice, ls), bodyX, ty, rgb(tok_.body));
+      outlined(text_.layout(cr, run, ls), x, ty, rgb(tok_.body));
     }
     ty += lh;
   }
