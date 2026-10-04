@@ -17,6 +17,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "bili.hpp"
 #include "cairo_util.hpp"
 #include "demo_faces.hpp"
+#include "history.hpp"
 #include "message.hpp"
 #include "notice.hpp"
 #include "panel.hpp"
@@ -125,6 +127,17 @@ void usage(std::FILE* out) {
       "                     panel, so entry notices folded into a combined row by --entry-merge\n"
       "                     and gifts folded into a counted row by --gift-merge do not count\n"
       "                     towards it\n"
+      "  --history N        Keep the last N rows on disk and paint them back at the next start,\n"
+      "                     above a rule so the two are not read as one conversation. Default 0,\n"
+      "                     which is off: the overlay starts empty and writes nothing. Paid\n"
+      "                     messages are not kept -- they are pinned with a dwell clock, and\n"
+      "                     re-pinning yesterday's would be a lie about when it was paid\n"
+      "  --history-file PATH  Where --history keeps its file, default\n"
+      "                     $XDG_STATE_HOME/pw-live-danmaku/history.json. A leading ~ is expanded\n"
+      "                     to $HOME. The file is written atomically and read on startup; one that\n"
+      "                     is missing or unreadable simply starts the overlay with no history\n"
+      "  --history-label TEXT  Text on the rule between restored and live rows, default 上次.\n"
+      "                     Empty draws the rule alone\n"
       "  --seconds N        Exit after N seconds (0 = never)\n"
       "  --demo             Draw a fixed set of messages and no network at all, for tuning the\n"
       "                     layout without a live room. Overrides --room.\n"
@@ -143,6 +156,14 @@ struct Options {
   std::vector<std::string> fontFiles;
   std::string font;
   int width = 480, height = 1080, fps = 30, count = 0, seconds = 0;
+  // --history's window size, in rows: what is kept, what is written and what is restored. 0 is off.
+  // The bound is not arbitrary -- it is a cap on the file as much as on the memory, and a window
+  // taller than the panel could hold would restore rows nobody ever saw.
+  int historyRows = 0;
+  std::string historyFile;
+  // optional rather than a plain string because the empty string is a real value here: it is how
+  // the rule is asked to carry no label at all.
+  std::optional<std::string> historyLabel;
   // The default is EntryMerger's own rather than a literal here, so the number cannot drift between
   // the two. Not clamped to a minimum: 0 is a real value meaning "no combining", so a lower bound
   // would make it unreachable exactly when someone asks for it.
@@ -205,6 +226,12 @@ Args parseArgs(int argc, char** argv, Options& o) {
       o.dump = next(i);
     } else if (a == "--count") {
       o.count = std::max(0, std::stoi(next(i)));
+    } else if (a == "--history") {
+      o.historyRows = std::clamp(std::stoi(next(i)), 0, 20000);
+    } else if (a == "--history-file") {
+      o.historyFile = next(i);
+    } else if (a == "--history-label") {
+      o.historyLabel = next(i);
     } else if (a == "--seconds") {
       o.seconds = std::max(0, std::stoi(next(i)));
     } else if (a == "--demo") {
@@ -228,6 +255,11 @@ struct Shared {
   std::string lastEvent;
   std::deque<Message> pending;
   uint64_t total = 0, dropped = 0;
+  /** The on-disk history, when --history is on. Null otherwise. Recorded here rather than in the
+   *  frame callback on purpose: this runs whether or not a consumer is attached, so the rows are on
+   *  disk even when the overlay spent the whole stream with nothing watching it. The write itself
+   *  happens outside the lock below, since add() does no I/O and only says when one is due. */
+  HistoryStore* history = nullptr;
   // Why a message is showing the placeholder disc. The fetch counters cannot answer this: a user
   // with no face URL is never requested, so it looks identical to a face that has not arrived yet.
   uint64_t avatarEmpty = 0, avatarHttps = 0, avatarHttp = 0, avatarProtoRel = 0, avatarOther = 0;
@@ -245,13 +277,20 @@ struct Shared {
   }
 
   void append(Message m) {
-    std::lock_guard<std::mutex> lk(mu);
-    ++total;
-    pending.push_back(std::move(m));
-    while (pending.size() > kPendingCap) {
-      pending.pop_front();
-      ++dropped;
+    bool flush = false;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      ++total;
+      // Recorded before the move into the queue, so the copy is made from the message as the site
+      // built it rather than from what is left of it.
+      if (history && m.kind != MsgKind::Paid) flush = history->add(m, steadyMs());
+      pending.push_back(std::move(m));
+      while (pending.size() > kPendingCap) {
+        pending.pop_front();
+        ++dropped;
+      }
     }
+    if (flush) history->save();
   }
   void note(const std::string& event) {
     std::lock_guard<std::mutex> lk(mu);
@@ -728,9 +767,19 @@ int main(int argc, char** argv) {
     tokens.fontCardName = o.cardFontSize;
     tokens.fontCardAmount = o.cardFontSize;
   }
+  if (o.historyLabel) tokens.dividerLabel = *o.historyLabel;
+
+  // --history: the last N rows are kept in this file as they arrive and painted back at the next
+  // start. Off unless asked for, and off entirely when the path cannot be resolved, in which case
+  // the store says nothing and simply does nothing.
+  if (!o.historyFile.empty()) o.historyFile = expandTilde(o.historyFile);
+  HistoryStore history(o.historyFile.empty() ? HistoryStore::defaultPath() : o.historyFile,
+                       static_cast<size_t>(o.historyRows));
+  history.setRoom(o.room);
 
   Shared sh;
   sh.roomLabel = o.demo ? std::string("demo") : o.room;
+  sh.history = &history;
 
   // The panel is built before the image stores because the stores have to be told how large to
   // decode: the avatar box is one line of body text, so it is only known once the font is measured,
@@ -742,6 +791,20 @@ int main(int argc, char** argv) {
   // the chat rather than being scrolled by it.
   PinnedLayer pinned(tokens);
   pinned.resize(o.width, o.height);
+
+  // The previous run's rows, painted before anything else so the rule lands between them and the
+  // first live row rather than under it. --demo is excluded: it is a fixed layout fixture, and a
+  // run that draws nothing but itself must not write or read a history either.
+  size_t restored = 0;
+  if (!o.demo && history.enabled()) {
+    const std::vector<Message> past = history.restore();
+    if (!past.empty()) {
+      panel.rebuildLayer(past, true);
+      restored = past.size();
+      std::fprintf(stderr, "[history] restored %zu row(s) from %s\n", restored,
+                   history.path().c_str());
+    }
+  }
 
   // Decoded at twice the box, so the face stays crisp on a hidpi canvas without storing four times
   // the pixels it needs. The capacity is separate and only bounds memory: a busy room shows roughly
@@ -858,6 +921,9 @@ int main(int argc, char** argv) {
       else
         std::printf("  Room:  %s\n  Auth:  %s\n", o.room.c_str(),
                     o.cookie.empty() ? "anonymous (nicknames masked)" : "cookie");
+      if (history.enabled())
+        std::printf("  History: %s  [window %d rows, %zu restored]\n", history.path().c_str(),
+                    o.historyRows, restored);
       std::fflush(stdout);
 
       std::thread avatarThread([&avatars] { avatars.runWorker(); });
@@ -919,6 +985,9 @@ int main(int argc, char** argv) {
       if (emoteThread.joinable()) emoteThread.join();
       if (stats.joinable()) stats.join();
       if (killer.joinable()) killer.join();
+      // After the joins, so the last thing the site thread recorded is on disk rather than lost to a
+      // clean exit: the throttle means the tail of a quiet room can be a few rows deep.
+      history.save();
       return 0;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "startup failed: %s\n", e.what());
@@ -944,6 +1013,9 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   stop.store(true);
   site.join();
+  // Same reasoning as the long-running path: the dump collected real rows, so they are worth
+  // keeping even though this run was only meant to produce one PNG.
+  history.save();
   // Bounded wait for the fetches already queued; a slow CDN must not hang the dump. The condition is
   // "there is still a backlog", not "nothing has arrived yet" -- the latter returns after the
   // first avatar and leaves the rest as placeholder discs.

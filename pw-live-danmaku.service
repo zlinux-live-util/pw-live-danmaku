@@ -32,6 +32,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+# --history writes to $XDG_STATE_HOME/pw-live-danmaku, which ProtectHome=read-only above would
+# otherwise deny. StateDirectory= creates that one directory and grants this unit write access to
+# it; the program creates the file itself and treats an unwritable path as "no history" rather than
+# as a failure, so the unit still starts if it is ever removed from the command line.
+StateDirectory=pw-live-danmaku
 # The cookie file (if used) is read at startup from $HOME. The `-` prefix matters: without it a
 # user who never configures a cookie has no such directory, and systemd then fails the unit before
 # ExecStart rather than letting the program run without one. The cookie is optional; the unit

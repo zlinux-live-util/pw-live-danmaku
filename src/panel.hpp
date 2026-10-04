@@ -98,6 +98,18 @@ struct PanelTokens {
   uint32_t body = 0xFFFFFF;         // --text-content-color
   uint32_t outlineColor = 0x000000; // --outline-color
 
+  // The rule that separates restored history from the messages arriving after it. Nothing in the
+  // reference stylesheet draws one, because nothing there survives a restart: the column always
+  // begins with something that just happened. These tokens exist so the rule can be drawn the same
+  // way everything else is -- measured, dimmed, outlined against the video -- and so it can be
+  // turned off by clearing dividerLabel rather than by editing the renderer.
+  uint32_t divider = 0xFFFFFF;
+  double dividerAlpha = 0.45;   // a rule, not a row: it must not compete with the chat above it
+  double dividerRule = 1.5;     // stroke width, the same weight as the text halo
+  double dividerGap = 12.0;     // air above and below the rule, so neither block touches it
+  double dividerFont = 20.0;    // the label's size, below the chat text on purpose
+  std::string dividerLabel = "上次";  // empty draws the rule alone
+
   // --membership-msg-bg-color is opaque; the paid-message card uses the same family at 0.55 so a
   // stack of cards does not become an opaque slab. Bilibili's paid card is cyan, which no
   // token in the stylesheet provides, so it is set here rather than in a site implementation.
@@ -119,6 +131,10 @@ struct Row {
   double h = 0.0;     // full height including the gap below
   bool card = false;
   std::string avatarUrl;
+  /** True for the rule between restored history and what arrived after it. It occupies space in the
+   *  column like a row does, so it scrolls and prunes as one, but it is not a message: it is not
+   *  counted, and it carries no avatar. */
+  bool divider = false;
 };
 
 class Panel {
@@ -163,11 +179,15 @@ class Panel {
   /** Side of the square the face is drawn in: one line of body text, as pango lays it out. Measured
    *  once per resize, since it is a property of the font and the size, not of any message. */
   double avatarBox() const;
-  /** Paints a whole list at once, anchored to the bottom. The offline --demo path and any future
-   *  "replay this file" path go through here: when every message is known up front there is nothing
-   *  to gain from the incremental append, and it avoids the entrance animation, which is meant for
-   *  a message that just arrived rather than for history. */
-  void rebuildLayer(const std::vector<Message>& msgs);
+  /** Paints a whole list at once, anchored to the bottom. The offline --demo path, and the path that
+   *  restores the previous run's messages, go through here: when every message is known up front
+   *  there is nothing to gain from the incremental append, and it avoids the entrance animation,
+   *  which is meant for a message that just arrived rather than for history.
+   *
+   *  With `divider`, a rule is painted under the last row -- the boundary between what was restored
+   *  and what arrives next. It then scrolls up with the restored rows as messages land below it and
+   *  eventually leaves with them, rather than sitting in a fixed place at the bottom of the frame. */
+  void rebuildLayer(const std::vector<Message>& msgs, bool divider = false);
 
  private:
   /** Distance from one line's baseline to the next: the stylesheet's line-height, but never less than
@@ -197,6 +217,12 @@ class Panel {
   /** Height a card occupies in the list: its text plus padding, plus the gap below it. */
   double cardHeight(const Message& m, cairo_t* cr, double w) const;
   double measureRow(const Message& m, cairo_t* cr, bool* isCard) const;
+  /** Height the rule takes: air, the rule or its label -- whichever is taller -- and air again. */
+  double dividerHeight(cairo_t* cr) const;
+  /** Paints the rule and its label at the top of a band `dividerHeight` tall. The label is centred
+   *  on the rule with the rule broken around it, so the two read as one mark rather than as text
+   *  with a line running through it. */
+  void paintDivider(cairo_t* cr, double y, double w) const;
   /** Height pango gives one line of text at this size. Not sizePx*lineHeight: a CJK face carries
    *  ascent+descent well past 1.0em, so the arithmetic figure is shorter than the glyphs it would
    *  have to hold. */
