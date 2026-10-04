@@ -64,6 +64,15 @@ struct Fragment {
   std::string url;
   /** Intrinsic emote size in pixels as advertised by the platform; 0 when unknown. */
   int px = 0;
+  /** Whether this run is the verb of an event -- the "投喂" on a gift -- rather than something a
+   *  viewer typed. The panel draws a marked run in the accent colour instead of body white, so an
+   *  event row does not read as one more line of chat.
+   *
+   *  Marked by the site layer rather than guessed by the panel. "The text before the first
+   *  picture" would be a guess about how one site happens to order its fragments, and the panel is
+   *  not supposed to have an opinion about that: a site says which of its runs is a verb, and
+   *  nothing else changes for it. */
+  bool verb = false;
 };
 
 struct Message {

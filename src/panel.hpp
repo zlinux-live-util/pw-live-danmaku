@@ -71,6 +71,17 @@ struct PanelTokens {
   // set here rather than in the site implementation, the same way the paid card's cyan is.
   uint32_t barGift = 0xF5C542;
 
+  // The accent a run marked as a verb is drawn in: the gift's "投喂", which was body white like any
+  // other line and so read as somebody having typed it. The same gold as barGift on purpose -- the
+  // verb and the bar are one event, and two colours on one row would read as two things.
+  uint32_t verbGift = 0xF5C542;
+
+  // What a gift's name is drawn in while its picture has not arrived, and the token is standing in
+  // the image's place. Bilibili's pink: no token in the stylesheet for it, the same way the paid
+  // card's cyan is not one. Body white made it read as a word somebody had typed, sitting in the
+  // middle of the row between the gold verb and the count.
+  uint32_t nameGift = 0xFB7299;
+
   /** How far down the two ambient kinds -- entry notices and likes -- are drawn. They have the same
    *  shape as a chat row and the same outline, so without this they compete with what was actually
    *  typed for the same attention. Their arrival rates differ from chat's by more than an order of
@@ -216,11 +227,15 @@ class Panel {
    *  baseline, the way vertical-align: baseline aligns an inline image. alpha is the row's own
    *  alpha, so a picture on a dimmed row dims with the words beside it.
    *
+   *  kind is the row's, and it is what decides the colour of the token-as-text fallback: on a gift
+   *  row the token is the gift's name and wears the gift's pink, while on every other row it is
+   *  ordinary chat text and stays that colour. See nameGift.
+   *
    *  The advance is the picture's box when there is a picture, and the measured width of the token
    *  when there is not -- a token can be much wider than the box, and returning the box either way
    *  drew whatever came next on top of it. */
   double drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline,
-                   double alpha) const;
+                   double alpha, MsgKind kind) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;
