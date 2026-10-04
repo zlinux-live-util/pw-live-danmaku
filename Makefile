@@ -39,7 +39,7 @@ UNIT_DIR     ?= $(HOME)/.config/systemd/user
 # `--cookie-file ~/...`. systemd does not expand `~`, so it reaches the program verbatim and the
 # unit dies with "cannot read cookie file" once every 3 seconds. %h is systemd's home-directory
 # specifier and is what the unit's own ReadOnlyPaths= line already uses.
-SERVICE_ARGS ?= --room 1746707149 --node pw-live-danmaku --size 480x1080 --fps 30
+SERVICE_ARGS ?= --room 1746707149 --node pw-live-danmaku --size 480x1080 --fps 30 --history 60
 
 .PHONY: all clean run install-service uninstall-service compile-commands test
 
@@ -59,12 +59,19 @@ build/pwvideo/%.o: $(PWNODE_DIR)/%.cpp
 # picture. Not part of `all`, because they are a development aid rather than a runtime requirement.
 # -Isrc because the tests live outside src/ and include its headers by name.
 TESTFLAGS := $(CXXFLAGS) -Isrc
-test: build/tests/json build/tests/bili
-	@build/tests/json && build/tests/bili
+test: build/tests/json build/tests/history build/tests/bili
+	@build/tests/json && build/tests/history && build/tests/bili
 
 build/tests/json: src/json.cpp tests/json_test.cpp
 	@mkdir -p build/tests
 	$(CXX) $(TESTFLAGS) -o $@ src/json.cpp tests/json_test.cpp
+
+# The store is a file format and a bounded deque, with no UI to look at, so it is checked the same
+# way: round trip, window, throttle, and the files that must be refused. message.cpp is in for
+# plainText(), which the round trip calls; json.cpp is the reader the file is parsed with.
+build/tests/history: src/history.cpp src/json.cpp src/message.cpp tests/history_test.cpp
+	@mkdir -p build/tests
+	$(CXX) $(TESTFLAGS) -o $@ src/history.cpp src/json.cpp src/message.cpp tests/history_test.cpp
 
 # bili.cpp uses the submodule's HttpClient and the Message model, so both are linked in, and pb.cpp
 # because the entry and gift events are protobuf blobs rather than JSON.

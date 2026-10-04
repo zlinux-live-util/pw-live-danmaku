@@ -558,9 +558,93 @@ void Panel::shiftAndPaint(const Message& m, double h) {
   paintRow(layerCr_.get(), m, 0.0, height_ - h, static_cast<double>(width_));
 }
 
-/** Paints a whole list at once. Used for --demo and after a reset, where every message is known up
- *  front and the incremental path would only be paying for the same work one row at a time. */
-void Panel::rebuildLayer(const std::vector<Message>& msgs) {
+/** Height the divider band takes. Measured from the same pango layout the label is drawn with, so
+ *  the band cannot come out shorter than its own label -- which would clip it, since the band is the
+ *  only space allocated for it. */
+double Panel::dividerHeight(cairo_t* cr) const {
+  double inner = tok_.dividerRule;
+  if (!tok_.dividerLabel.empty()) {
+    pwvideo::LabelSpec ls;
+    ls.family = tok_.font;
+    ls.sizePx = tok_.dividerFont;
+    ls.center = false;
+    inner = std::max(inner, static_cast<double>(pwvideo::TextRenderer::measure(text_.layout(
+                                                       cr, tok_.dividerLabel, ls))
+                                                       .height));
+  }
+  return inner + 2.0 * tok_.dividerGap;
+}
+
+void Panel::paintDivider(cairo_t* cr, double y, double w) const {
+  const double x0 = tok_.padX;
+  const double x1 = w - tok_.padRight;
+  const double mid = (x0 + x1) / 2.0;
+  // Half the band is air, so the rule itself sits on its vertical centre.
+  const double ly = y + tok_.dividerGap + tok_.dividerRule / 2.0;
+  const pwvideo::Rgba col = rgb(tok_.divider, tok_.dividerAlpha);
+
+  // The label is measured first so the rule can be broken around it. Half its width plus a margin on
+  // each side is the gap; an empty label leaves the rule whole.
+  double gapHalf = 0.0;
+  double labelW = 0.0, labelH = 0.0;
+  if (!tok_.dividerLabel.empty()) {
+    pwvideo::LabelSpec ls;
+    ls.family = tok_.font;
+    ls.sizePx = tok_.dividerFont;
+    ls.center = false;
+    const pwvideo::LabelMetrics lm =
+        pwvideo::TextRenderer::measure(text_.layout(cr, tok_.dividerLabel, ls));
+    labelW = static_cast<double>(lm.width);
+    labelH = static_cast<double>(lm.height);
+    // Bounded by half the rule's own length: a label wider than the panel -- which a long
+    // --history-label on a narrow --size can be -- would otherwise leave the two segments drawn
+    // backwards from the middle, and the mark would come out as a line through the text.
+    gapHalf = std::min(labelW / 2.0 + 10.0, std::max(0.0, (x1 - x0) / 2.0 - 1.0));
+  }
+
+  cairo_save(cr);
+  cairo_set_line_width(cr, tok_.dividerRule);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+  // Two strokes, the dark one wider and underneath: the same trick as the text halo. A hairline at
+  // this alpha vanishes against a bright video, which is the one background that matters.
+  const double segs = gapHalf > 0.0 ? 2 : 1;
+  for (int pass = 0; pass < 2; ++pass) {
+    const pwvideo::Rgba c = pass == 0 ? rgb(tok_.outlineColor, 0.5 * col.a) : col;
+    cairo_set_line_width(cr, pass == 0 ? tok_.dividerRule + 2.0 : tok_.dividerRule);
+    cairo_set_source_rgba(cr, c.r, c.g, c.b, c.a);
+    if (segs == 1) {
+      cairo_move_to(cr, x0, ly);
+      cairo_line_to(cr, x1, ly);
+    } else {
+      cairo_move_to(cr, x0, ly);
+      cairo_line_to(cr, mid - gapHalf, ly);
+      cairo_move_to(cr, mid + gapHalf, ly);
+      cairo_line_to(cr, x1, ly);
+    }
+    cairo_stroke(cr);
+  }
+
+  if (gapHalf > 0.0) {
+    pwvideo::LabelSpec ls;
+    ls.family = tok_.font;
+    ls.sizePx = tok_.dividerFont;
+    ls.center = false;
+    // Centred on the rule even when the gap around it had to be clamped, so the two stay one mark.
+    const double lx = mid - labelW / 2.0;
+    const pwvideo::Rgba dim = rgb(tok_.body, tok_.dividerAlpha);
+    pwvideo::TextRenderer::outline(cr, text_.layout(cr, tok_.dividerLabel, ls), lx,
+                                   ly - labelH / 2.0, tok_.outline,
+                                   rgb(tok_.outlineColor, 0.7 * dim.a));
+    pwvideo::TextRenderer::fill(cr, text_.layout(cr, tok_.dividerLabel, ls), lx, ly - labelH / 2.0,
+                                dim);
+  }
+  cairo_restore(cr);
+}
+
+/** Paints a whole list at once. Used for --demo, after a reset, and to restore the previous run's
+ *  messages, where every row is known up front and the incremental path would only be paying for
+ *  the same work one row at a time. */
+void Panel::rebuildLayer(const std::vector<Message>& msgs, bool divider) {
   clear();
   if (!layer_ || !layerCr_ || msgs.empty()) return;
   cairo_t* lc = layerCr_.get();
@@ -575,12 +659,22 @@ void Panel::rebuildLayer(const std::vector<Message>& msgs) {
   // way round would show the newest message at the top.
   double total = 0.0;
   for (double h : hs) total += h;
-  double y = static_cast<double>(height_) - total;
+  // The divider is part of the block, not an overlay on the frame: it has to occupy space and scroll
+  // with the rows above it, or it would end up sitting under the first live message instead of
+  // between the two.
+  const double dh = (divider && !msgs.empty()) ? dividerHeight(lc) : 0.0;
+  double y = static_cast<double>(height_) - total - dh;
   for (size_t i = 0; i < msgs.size(); ++i) {
     paintRow(lc, msgs[i], 0.0, y, static_cast<double>(width_));
-    rows_.push_back(Row{count_++, contentH_, hs[i], isCard(msgs[i].kind), msgs[i].avatarUrl});
+    rows_.push_back(Row{count_++, contentH_, hs[i], isCard(msgs[i].kind), msgs[i].avatarUrl, false});
     contentH_ += hs[i];
     y += hs[i];
+  }
+  if (dh > 0.0) {
+    paintDivider(lc, y, static_cast<double>(width_));
+    // count_ is left alone: --count counts messages, and a rule is not one.
+    rows_.push_back(Row{count_, contentH_, dh, false, std::string(), true});
+    contentH_ += dh;
   }
 }
 
