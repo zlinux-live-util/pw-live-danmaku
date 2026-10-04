@@ -186,7 +186,7 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   const InlineBody body = buildBody(m);
   PangoLayout* l = text_.layout(cr, body.text, spec);
   const int lines = std::max(1, pango_layout_get_line_count(l));
-  const double textH = static_cast<double>(lines) * tok_.fontBody * tok_.lineHeight;
+  const double textH = static_cast<double>(lines) * lineAdvance();
   return std::max(textH, avatarBox()) + tok_.rowGap;
 }
 
@@ -259,9 +259,12 @@ void Panel::drawAvatars(cairo_t* cr) const {
   }
 }
 
-void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const {
+void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline) const {
   const double d = tok_.emote;
-  const double y = lineTop + (lineH - d) / 2.0;
+  // Bottom edge on the line's baseline, which is what vertical-align: baseline does to an inline
+  // image: nothing of the box hangs below the baseline and the whole of it stands above. baseline is
+  // measured down from lineTop, so the box rises by its own height from there.
+  const double y = lineTop + baseline - d;
 
   pwvideo::SurfacePtr surf;
   if (emotes_ && !f.url.empty()) surf = emotes_->lookup(f.url);
@@ -269,16 +272,17 @@ void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, 
   if (!surf) {
     // Not fetched yet, or the platform advertised a token with no picture. Either way the message
     // still has to read, so the token is drawn as text in the same place the picture would be.
+    // It is text, so it goes on the line exactly like every other run: no baseline arithmetic,
+    // which would only put the token a line out of step with the words beside it.
     pwvideo::LabelSpec ls;
     ls.family = tok_.font;
     ls.center = false;
     ls.bold = true;
     ls.sizePx = tok_.fontBody;
     ls.maxLines = 1;
-    const double ty = y + (d - tok_.fontBody * tok_.lineHeight) / 2.0;
     PangoLayout* l = text_.layout(cr, f.text, ls);
-    pwvideo::TextRenderer::outline(cr, l, x, ty, tok_.outline, rgb(tok_.outlineColor, 0.85));
-    pwvideo::TextRenderer::fill(cr, l, x, ty, rgb(tok_.body));
+    pwvideo::TextRenderer::outline(cr, l, x, lineTop, tok_.outline, rgb(tok_.outlineColor, 0.85));
+    pwvideo::TextRenderer::fill(cr, l, x, lineTop, rgb(tok_.body));
     return;
   }
 
@@ -378,7 +382,7 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   PangoLayout* bl = text_.layout(cr, body.text, bs);
 
   const int nLines = std::max(1, pango_layout_get_line_count(bl));
-  const double lh = tok_.fontBody * tok_.lineHeight;
+  const double lh = lineAdvance();
 
   // The bar spans the whole content height of the row, so a wrapped message gets a bar as long as
   // the text it belongs to. It is drawn here rather than before the body was laid out because its
@@ -406,6 +410,22 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     if (pl) spans.emplace_back(static_cast<size_t>(pl->start_index), static_cast<size_t>(pl->length));
   }
   if (spans.empty()) spans.emplace_back(0, body.text.size());
+
+  // How far below the top of a line box pango puts that line's baseline. Measured, not derived: it
+  // is a property of whichever family in the chain answered, and a CJK face carries an ascent well
+  // past 1.0em, so fontBody*0.8 comes out several pixels short and an emote aligned against it hangs
+  // low. Read here, after the spans above have been copied out and before the loop below starts
+  // rebinding TextRenderer's single layout -- any earlier and the wrapped line list is lost, and
+  // once per emote would cost a layout each time.
+  double baseline = 0.0;
+  {
+    pwvideo::LabelSpec ps = bs;
+    ps.widthPx = 0.0;  // natural width, so the probe is one line
+    ps.maxLines = 1;
+    PangoLayout* probe = text_.layout(cr, "Ag", ps);
+    const int b = pango_layout_get_baseline(probe) / PANGO_SCALE;
+    if (b > 0) baseline = static_cast<double>(b);
+  }
 
   for (const auto& span : spans) {
     // Pango keeps the newline at the end of a line's text run; drop it before measuring.
@@ -435,7 +455,7 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
         outlined(rl, x, ty, rgb(tok_.body));
         x += rw;
       }
-      drawEmote(cr, m.parts[em.second], x, ty, lh);
+      drawEmote(cr, m.parts[em.second], x, ty, baseline);
       x += tok_.emote;
       cursor = em.first + kEmoteCharLen;  // step over the placeholder itself
     }

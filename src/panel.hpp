@@ -149,6 +149,17 @@ class Panel {
   void rebuildLayer(const std::vector<Message>& msgs);
 
  private:
+  /** Distance from one line's baseline to the next: the stylesheet's line-height, but never less than
+   *  an emote box plus a little air.
+   *
+   *  An inline emote sits on the baseline and reaches up by its own height, so a line advance of
+   *  exactly the emote size would let it touch the line above and push into the line below. Both
+   *  measureRow() and paintRow() take their advance from here, so the height a row is allocated and
+   *  the height it is drawn at cannot drift apart. */
+  double lineAdvance() const {
+    return std::max(tok_.fontBody * tok_.lineHeight, tok_.emote + 2.0);
+  }
+
   /** One line of a card, laid out and measured. */
   struct CardLine {
     std::string text;
@@ -187,8 +198,13 @@ class Panel {
    *  arriving after its row was laid out appears without the row having to be redrawn. */
   void drawAvatars(cairo_t* cr) const;
   /** Draws one inline emote into a box on the current line, or the token as text when the picture
-   *  has not arrived yet or the platform gave no URL for it. */
-  void drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double lineH) const;
+   *  has not arrived yet or the platform gave no URL for it.
+   *
+   *  lineTop is the top of the line's box, the same value every text run on the line is drawn at.
+   *  baseline is how far below that top pango puts the baseline, which depends on the font that
+   *  answered and is measured rather than derived; the emote's bottom edge is aligned to the
+   *  baseline, the way vertical-align: baseline aligns an inline image. */
+  void drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;
