@@ -559,6 +559,11 @@ void testParseGift() {
   // as "×1", which is what the site's own notice does.
   checkEq(m.plainText(), "投喂 人气票", "gift: verb, name, and no count for a single one");
   checkEqInt(m.parts.size(), size_t(2), "gift: the verb and the name-as-picture");
+  // The verb is marked, and the marker is on that fragment rather than on the row: the panel colours
+  // by offset into the body it already laid out, so a row whose verb did not survive the parse
+  // would draw as plain white text -- which is exactly how it looked before anything marked it.
+  check(m.parts[0].verb, "gift: the verb is marked, so the panel can accent it");
+  check(!m.parts[1].verb, "gift: and the gift name is not -- it is a picture, not the verb");
   checkEqInt(static_cast<int>(m.parts[1].kind), static_cast<int>(Fragment::Kind::Emote),
              "gift: the picture rides the emote fragment, so the existing cache and draw path serve "
              "it");
@@ -606,7 +611,7 @@ Message makeGift(const char* who, const char* giftKey, int64_t count, const char
   g.user = who;
   g.avatarUrl = face;
   g.mergeKey = giftKey;
-  g.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  g.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0, true});
   // The icon carries the gift's name, taken as the last component of the key, so a fixture written
   // gift/2/小番茄 produces a row that reads like 小番茄 and not like every other fixture.
   const std::string key(giftKey);
@@ -638,6 +643,9 @@ void testGiftMergerFoldsOneViewerTappingTheSameGift() {
   checkEq(rows[0].user, "A", "gift merger: named after the viewer, as the first one was");
   checkEq(rows[0].plainText(), "投喂 人气票 ×10", "gift merger: counting them");
   checkEqInt(rows[0].count, 10LL, "gift merger: and the number agrees with the text");
+  // The mark has to survive the rebuild. withCount() rewrites the tail of the row, and a row that
+  // came out of it with a plain verb would be a gift whose "投喂" went back to being chat-white.
+  check(rows[0].parts[0].verb, "gift merger: the merged row still marks its verb");
   checkEqInt(m.pending(), 0LL, "gift merger: nothing left over");
 
   // A tap after the row went out is a new run, not an amendment to a row already on screen.

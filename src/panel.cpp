@@ -29,6 +29,10 @@ constexpr size_t kEmoteCharLen = 3;
 struct InlineBody {
   std::string text;
   std::vector<std::pair<size_t, size_t>> emotes;  // (byte offset in text, index into parts)
+  /** Byte ranges of the runs the site marked as a verb, in layout order: (offset, end). Carried
+   *  through to the drawing pass so the accent can be applied by offset into the same string pango
+   *  wrapped, rather than by working out again which fragment a byte belongs to. */
+  std::vector<std::pair<size_t, size_t>> verbs;
 };
 
 InlineBody buildBody(const Message& m) {
@@ -36,6 +40,7 @@ InlineBody buildBody(const Message& m) {
   for (size_t i = 0; i < m.parts.size(); ++i) {
     const Fragment& f = m.parts[i];
     if (f.kind == Fragment::Kind::Text) {
+      if (f.verb) b.verbs.emplace_back(b.text.size(), b.text.size() + f.text.size());
       b.text += f.text;
     } else {
       b.emotes.emplace_back(b.text.size(), i);
@@ -272,7 +277,7 @@ void Panel::drawAvatars(cairo_t* cr) const {
 }
 
 double Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline,
-                        double alpha) const {
+                        double alpha, MsgKind kind) const {
   const double d = tok_.emote;
   // Bottom edge on the line's baseline, which is what vertical-align: baseline does to an inline
   // image: nothing of the box hangs below the baseline and the whole of it stands above. baseline is
@@ -299,7 +304,12 @@ double Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop
     // The halo scales with the row's alpha here too, for the same reason as in outlined() below.
     pwvideo::TextRenderer::outline(cr, l, x, lineTop, tok_.outline,
                                    rgb(tok_.outlineColor, 0.85 * alpha));
-    pwvideo::TextRenderer::fill(cr, l, x, lineTop, rgb(tok_.body, alpha));
+    // On a gift row this token is the gift's name, standing where its picture would be, so it takes
+    // the gift's pink: in body white it read as a word somebody had typed, wedged between the gold
+    // verb and the count. Every other row's fallback is ordinary chat text -- an emote danmaku whose
+    // picture never turns up, or a gift with no URL at all -- and stays ordinary chat text.
+    const uint32_t col = kind == MsgKind::Gift ? tok_.nameGift : tok_.body;
+    pwvideo::TextRenderer::fill(cr, l, x, lineTop, rgb(col, alpha));
     // The advance is however wide that text actually is, not the emote box. A token can be far wider
     // than the box it stands in -- a gift name of three CJK characters at the body size is about
     // three times it -- and advancing by the box drew the next run straight on top of it.
@@ -461,6 +471,41 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     if (b > 0) baseline = static_cast<double>(b);
   }
 
+  // One piece of body text at (x, y) in one colour, and however wide pango says it came out. A
+  // piece is measured on its own rather than positioned from a layout of the whole line, which is
+  // what the run-at-a-time drawing below has always done.
+  const auto drawPiece = [&](size_t from, size_t to, double x, double y, uint32_t col) {
+    pwvideo::LabelSpec ls = spec;
+    ls.sizePx = tok_.fontBody;
+    ls.maxLines = 1;
+    PangoLayout* rl = text_.layout(cr, body.text.substr(from, to - from), ls);
+    int rw = 0, rh = 0;
+    pango_layout_get_pixel_size(rl, &rw, &rh);
+    outlined(rl, x, y, rgb(col, alpha));
+    return static_cast<double>(rw);
+  };
+
+  // [from, to) of this line, split wherever it crosses a run the site marked as a verb so the verb
+  // takes the accent and the words beside it stay body white. Split by byte offset into the string
+  // pango already wrapped, so where the line breaks is not something this pass gets a vote on --
+  // only the fill changes. A verb that wrapped onto the next line is clipped to [from, to) for the
+  // same reason, so each half is drawn on the line it belongs to.
+  const auto drawRun = [&](size_t from, size_t to, double x, double y) {
+    size_t cur = from;
+    double dx = x;
+    for (const auto& v : body.verbs) {
+      if (v.second <= from) continue;  // this verb ended on an earlier line
+      if (v.first >= to) break;        // and this one starts past the end of this line
+      const size_t vs = std::max(v.first, from);
+      const size_t ve = std::min(v.second, to);
+      if (vs > cur) dx += drawPiece(cur, vs, dx, y, tok_.body);
+      dx += drawPiece(vs, ve, dx, y, tok_.verbGift);
+      cur = ve;
+    }
+    if (cur < to) dx += drawPiece(cur, to, dx, y, tok_.body);
+    return dx - x;
+  };
+
   for (const auto& span : spans) {
     // Pango keeps the newline at the end of a line's text run; drop it before measuring.
     size_t len = span.second;
@@ -478,27 +523,11 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     for (const auto& em : body.emotes) {
       if (em.first < start) continue;
       if (em.first >= end) break;
-      if (em.first > cursor) {
-        const std::string run = body.text.substr(cursor, em.first - cursor);
-        pwvideo::LabelSpec ls = spec;
-        ls.sizePx = tok_.fontBody;
-        ls.maxLines = 1;
-        PangoLayout* rl = text_.layout(cr, run, ls);
-        int rw = 0, rh = 0;
-        pango_layout_get_pixel_size(rl, &rw, &rh);
-        outlined(rl, x, ty, rgb(tok_.body, alpha));
-        x += rw;
-      }
-      x += drawEmote(cr, m.parts[em.second], x, ty, baseline, alpha);
+      if (em.first > cursor) x += drawRun(cursor, em.first, x, ty);
+      x += drawEmote(cr, m.parts[em.second], x, ty, baseline, alpha, m.kind);
       cursor = em.first + kEmoteCharLen;  // step over the placeholder itself
     }
-    if (cursor < end) {
-      const std::string run = body.text.substr(cursor, end - cursor);
-      pwvideo::LabelSpec ls = spec;
-      ls.sizePx = tok_.fontBody;
-      ls.maxLines = 1;
-      outlined(text_.layout(cr, run, ls), x, ty, rgb(tok_.body, alpha));
-    }
+    if (cursor < end) drawRun(cursor, end, x, ty);
     ty += lh;
   }
   return ty - y;

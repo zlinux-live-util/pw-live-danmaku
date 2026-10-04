@@ -578,7 +578,7 @@ std::vector<Message> demoMessages() {
   Message gift;
   gift.kind = MsgKind::Gift;
   gift.user = "氧***";
-  gift.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  gift.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0, true});
   gift.parts.push_back(Fragment{Fragment::Kind::Emote, "人气票", "", 0});
   out.push_back(gift);
 
@@ -597,7 +597,7 @@ std::vector<Message> demoMessages() {
   Message giftMany;
   giftMany.kind = MsgKind::Gift;
   giftMany.user = "串***";
-  giftMany.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  giftMany.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0, true});
   giftMany.parts.push_back(Fragment{Fragment::Kind::Emote, "小番茄", "", 0});
   giftMany.parts.push_back(Fragment{Fragment::Kind::Text, " ×6", "", 0});
   out.push_back(std::move(giftMany));

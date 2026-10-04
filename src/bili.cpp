@@ -719,7 +719,13 @@ bool Bili::parseMessage(const Json& json, Message& out) {
 
     std::string verb(gift.str(18));
     if (verb.empty()) verb = "送出";  // measured as "投喂" on every capture, one gift family
-    out.parts.push_back(Fragment{Fragment::Kind::Text, verb + " ", "", 0});
+    // Marked as a verb rather than left as body text: it is what the site says happened, and drawn
+    // in the body colour it read as a line somebody had typed. The panel picks the accent; this
+    // layer only says which run is the verb.
+    Fragment verbRun;
+    verbRun.text = verb + " ";
+    verbRun.verb = true;
+    out.parts.push_back(std::move(verbRun));
 
     Fragment icon;
     icon.kind = Fragment::Kind::Emote;
