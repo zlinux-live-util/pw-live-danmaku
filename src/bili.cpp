@@ -619,7 +619,11 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     out.avatarUrl = d["face"].str();
     out.tsMs = static_cast<int64_t>(d["start_time"].num() * 1000);
     const int64_t price = d["price"].num();
-    if (price > 0) out.amount = "CN¥" + std::to_string(price);
+    if (price > 0) {
+      out.amount = "CN¥" + std::to_string(price);
+      // The number as well as the string: the pinned layer times how long this stays up from it.
+      out.amountValue = price;
+    }
     splitFragments(d["message"].str(), kNoEmotes, out.parts);
     if (d["medal_info"]["guard_level"].num() >= 3) out.type = UserType::Member;
     return true;

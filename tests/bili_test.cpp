@@ -12,6 +12,9 @@
 #include "bili.hpp"
 #include "json.hpp"
 #include "message.hpp"
+// Only for the dwell table, which is pure arithmetic and needs no cairo or panel state. Pulling the
+// header in costs pango, which the rest of this binary does not otherwise need.
+#include "notice.hpp"
 
 namespace {
 
@@ -358,7 +361,36 @@ void testParsePaidCard() {
   checkEq(m.user, "五条悟", "SC: user");
   checkEq(m.plainText(), "已经没有什么可怕的了", "SC: message");
   checkEq(m.amount, "CN¥30", "SC: price");
+  // The pinned layer times a notice's dwell from the number, not from the string it is shown as, so
+  // the price has to arrive in both forms.
+  checkEqInt(m.amountValue, 30, "SC: price also carried as a number, for the dwell");
   checkEqInt(m.tsMs, 1791046553000LL, "SC: start_time is seconds, converted to ms");
+}
+
+void testPinnedDwellTable() {
+  // The bands of the published price table, including the boundaries themselves: a message priced
+  // exactly at a threshold belongs to the band that starts there, not to the cheaper one below it.
+  struct Case {
+    int64_t value;
+    int64_t expectMs;
+    const char* what;
+  };
+  const Case cases[] = {
+      {0, 60 * 1000, "nothing paid falls in the shortest band rather than zero"},
+      {29, 60 * 1000, "just under 30 is still the 60s band"},
+      {30, 60 * 1000, "30 is 60s"},
+      {49, 60 * 1000, "just under 50 is still 60s"},
+      {50, 2 * 60 * 1000, "50 is 2min"},
+      {99, 2 * 60 * 1000, "just under 100 is still 2min"},
+      {100, 5 * 60 * 1000, "100 is 5min"},
+      {500, 30 * 60 * 1000, "500 is 30min"},
+      {1000, 60 * 60 * 1000, "1000 is 1h"},
+      {1999, 60 * 60 * 1000, "just under 2000 is still 1h"},
+      {2000, 2 * 60 * 60 * 1000, "2000 is 2h"},
+      {100000, 2 * 60 * 60 * 1000, "above the top band does not run past 2h"},
+  };
+  for (const Case& c : cases)
+    checkEqInt(PinnedLayer::dwellFor(c.value), c.expectMs, c.what);
 }
 
 void testParseMembershipCard() {
@@ -438,6 +470,7 @@ int main() {
   testParseDanmakuTextWithBrackets();
   testSplitFragments();
   testParsePaidCard();
+  testPinnedDwellTable();
   testParseMembershipCard();
   testParseIgnoresOtherCmds();
   testAuthPacketLayout();

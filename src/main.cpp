@@ -28,6 +28,7 @@
 #include "cairo_util.hpp"
 #include "demo_faces.hpp"
 #include "message.hpp"
+#include "notice.hpp"
 #include "panel.hpp"
 #include "pwvideo.hpp"
 #include "ws.hpp"
@@ -405,22 +406,8 @@ std::vector<Message> demoMessages() {
     out.push_back(std::move(m));
   }
 
-  Message paid;
-  paid.kind = MsgKind::Paid;
-  paid.user = "五条悟";
-  paid.amount = "CN¥30.0";
-  // The body of a paid card is its third line, and a real SUPER_CHAT always has one. Leaving it
-  // out here is what let the card be painted shorter than the text in it go unnoticed.
-  paid.parts.emplace_back(Fragment{Fragment::Kind::Text, "醒目留言：第三行必须待在卡片里", "", 0});
-  out.push_back(paid);
-
-  Message paid2;
-  paid2.kind = MsgKind::Paid;
-  paid2.user = "ディオ・ブランドー";
-  paid2.amount = "CN¥50.0";
-  paid2.parts.emplace_back(Fragment{Fragment::Kind::Text, "A paid card whose body wraps nowhere", "", 0});
-  out.push_back(paid2);
-
+  // Paid messages are not here: they live in the pinned layer, and the demo builds those separately
+  // so both halves of the frame can be checked at once.
   Message sub;
   sub.kind = MsgKind::Membership;
   sub.user = "xfgryujk";
@@ -441,6 +428,40 @@ std::vector<Message> demoMessages() {
     if (m.kind != MsgKind::Text) continue;
     m.avatarUrl = demoFaceKey(face++);
   }
+  return out;
+}
+
+/** The pinned layer's demo content.
+ *
+ *  Two notices, because one cannot show either thing that matters here: a short one proves the card
+ *  is sized to its content, and a long one proves the body wraps instead of being ellipsized. The
+ *  amounts are set on amountValue as well as the display string, since the dwell is read from the
+ *  number -- without it both would fall into the cheapest band and expire after a minute. */
+std::vector<Message> demoNotices() {
+  std::vector<Message> out;
+
+  Message big;
+  big.kind = MsgKind::Paid;
+  big.user = "五条悟";
+  big.amount = "CN¥500";
+  big.amountValue = 500;
+  // Deliberately longer than the panel is wide, and without spaces for pango to break on, so the only
+  // way it can fit is by wrapping: an ellipsized card would cut this off after one line.
+  big.parts.emplace_back(Fragment{
+      Fragment::Kind::Text,
+      "醒目留言会自动换行显示完整内容不会被省略掉所以这里故意写得很长很长很长很长很长很长很长"
+      "很长很长很长很长很长很长很长很长很长很长很长很长",
+      "", 0});
+  out.push_back(big);
+
+  Message small;
+  small.kind = MsgKind::Paid;
+  small.user = "ディオ・ブランドー";
+  small.amount = "CN¥30";
+  small.amountValue = 30;
+  small.parts.emplace_back(Fragment{Fragment::Kind::Text, "短的一条", "", 0});
+  out.push_back(small);
+
   return out;
 }
 
@@ -522,6 +543,11 @@ int main(int argc, char** argv) {
   // and a face decoded at the wrong size is either soft or needlessly large in memory.
   Panel panel(tokens);
   panel.resize(o.width, o.height);
+  // Paid messages do not go into the scrolling panel; they are held at the top of the frame on their
+  // own clock. Both layers read the same tokens and are drawn in this order, so a notice sits over
+  // the chat rather than being scrolled by it.
+  PinnedLayer pinned(tokens);
+  pinned.resize(o.width, o.height);
 
   // Decoded at twice the box, so the face stays crisp on a hidpi canvas without storing four times
   // the pixels it needs. The capacity is separate and only bounds memory: a busy room shows roughly
@@ -548,11 +574,27 @@ int main(int argc, char** argv) {
 
   // Reused across frames so the render path does not allocate.
   std::vector<Message> fresh;
+  // Each batch is split by destination: paid messages go to the pinned layer and everything else to
+  // the scrolling panel. A paid message left in the list would scroll off within a second, which is
+  // the opposite of what it is for.
+  std::vector<Message> chat, paid;
 
   auto drawOnce = [&](int64_t now) {
     drain(sh, fresh);
-    panel.update(fresh, now);
+    chat.clear();
+    paid.clear();
+    for (const Message& m : fresh) {
+      if (m.kind == MsgKind::Paid)
+        paid.push_back(m);
+      else
+        chat.push_back(m);
+    }
+    // Updated before the panel so a notice that arrives on this frame is on it, not the next one.
+    // render() then retires anything whose dwell ran out, which needs no new message to happen.
+    pinned.update(frame.cr(), paid, now);
+    panel.update(chat, now);
     panel.render(frame.cr(), now);
+    pinned.render(frame.cr(), now);
   };
 
   /** Renders a short run and leaves the settled state in the frame.
@@ -563,7 +605,10 @@ int main(int argc, char** argv) {
    *  effects: advance the clock past the transient and keep the last frame. */
   auto settleForDump = [&](int frames = 12) {
     const int64_t t0 = steadyMs();
-    for (int i = 0; i < frames; ++i) panel.render(frame.cr(), t0 + (i + 1) * 33);
+    for (int i = 0; i < frames; ++i) {
+      panel.render(frame.cr(), t0 + (i + 1) * 33);
+      pinned.render(frame.cr(), t0 + (i + 1) * 33);
+    }
   };
 
   if (o.demo) {
@@ -571,8 +616,12 @@ int main(int argc, char** argv) {
     sh.setState("demo (no network)");
     installDemoFaces();
     panel.rebuildLayer(demoMessages());
+    // Handed to the pinned layer all at once, the way a live batch arrives. Its dwell is minutes to
+    // hours, so nothing here expires during a dump.
+    pinned.update(frame.cr(), demoNotices(), steadyMs());
     if (!o.dump.empty()) {
       panel.render(frame.cr(), steadyMs());
+      pinned.render(frame.cr(), steadyMs());
       settleForDump();
       if (!frame.writePng(o.dump)) {
         std::fprintf(stderr, "PNG write failed: %s\n", o.dump.c_str());

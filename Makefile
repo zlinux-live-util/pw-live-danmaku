@@ -63,11 +63,13 @@ build/tests/json: src/json.cpp tests/json_test.cpp
 	$(CXX) $(TESTFLAGS) -o $@ src/json.cpp tests/json_test.cpp
 
 # bili.cpp uses the submodule's HttpClient and the Message model, so both are linked in.
-build/tests/bili: src/bili.cpp src/json.cpp src/ws.cpp src/message.cpp tests/bili_test.cpp \
-                  $(PWNODE_DIR)/extras/http.cpp
+build/tests/bili: src/bili.cpp src/json.cpp src/ws.cpp src/message.cpp src/notice.cpp \
+                  tests/bili_test.cpp $(PWNODE_DIR)/extras/http.cpp \
+                  $(PWNODE_DIR)/extras/text.cpp $(PWNODE_DIR)/extras/cairo_util.cpp
 	@mkdir -p build/tests
-	$(CXX) $(TESTFLAGS) -o $@ src/bili.cpp src/json.cpp src/ws.cpp src/message.cpp \
-	    tests/bili_test.cpp $(PWNODE_DIR)/extras/http.cpp $(LDLIBS)
+	$(CXX) $(TESTFLAGS) -o $@ src/bili.cpp src/json.cpp src/ws.cpp src/message.cpp src/notice.cpp \
+	    tests/bili_test.cpp $(PWNODE_DIR)/extras/http.cpp $(PWNODE_DIR)/extras/text.cpp \
+	    $(PWNODE_DIR)/extras/cairo_util.cpp $(LDLIBS)
 
 # Verify the video node end to end without OBS: attach as a consumer, land the frames on disk. The
 # file is exactly width*height*4 bytes per frame in BGRA.

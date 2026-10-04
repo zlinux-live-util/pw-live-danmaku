@@ -60,6 +60,14 @@ struct Message {
    *  plain chat line. */
   std::string amount;
 
+  /** The same price as a number, in whole units of the site's currency; 0 when there is none.
+   *
+   *  Carried beside the formatted `amount` because presentation needs the magnitude, not the
+   *  rendering: a pinned paid message stays up for a time that depends on what was paid, and
+   *  recovering that from "CN¥1980" would mean parsing a display string back into a number. A site
+   *  that bills in a different unit sets it to what its own table is denominated in. */
+  int64_t amountValue = 0;
+
   int64_t tsMs = 0;
 
   /** The body as plain text, concatenating the text runs and keeping emote tokens as typed. Used
