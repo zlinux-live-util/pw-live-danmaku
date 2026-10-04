@@ -35,6 +35,10 @@ endif
 # systemd user service: the unit is a template; @REPO@ / @ARGS@ are substituted at install time
 UNIT         := pw-live-danmaku.service
 UNIT_DIR     ?= $(HOME)/.config/systemd/user
+# If you override SERVICE_ARGS to pass a cookie, write the path as `--cookie-file %h/...`, not
+# `--cookie-file ~/...`. systemd does not expand `~`, so it reaches the program verbatim and the
+# unit dies with "cannot read cookie file" once every 3 seconds. %h is systemd's home-directory
+# specifier and is what the unit's own ReadOnlyPaths= line already uses.
 SERVICE_ARGS ?= --room 1746707149 --node pw-live-danmaku --size 480x1080 --fps 30
 
 .PHONY: all clean run install-service uninstall-service compile-commands test

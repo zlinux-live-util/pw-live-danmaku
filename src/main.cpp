@@ -43,6 +43,19 @@ int64_t steadyMs() {
       .count();
 }
 
+/** Expand a leading `~` to $HOME. A shell does this before the program ever sees the argument, so
+ *  it is redundant there -- but the systemd unit does not, and passes `~/.config/...` through as a
+ *  literal string. The unit could write `%h` instead, but a path that only resolves when it comes
+ *  from a shell is a trap: the same unit file, the same argument, works in a terminal and fails
+ *  under systemd with a bare `cannot read cookie file`. Doing it here makes the argument mean the
+ *  same thing no matter who expanded it. `~/` and a bare `~` both mean $HOME, as in a shell. */
+std::string expandTilde(const std::string& path) {
+  if (path != "~" && path.compare(0, 2, "~/") != 0) return path;
+  const char* home = std::getenv("HOME");
+  if (!home || !*home) return path;  // Nothing to expand against; let the open fail on its own terms
+  return std::string(home) + path.substr(1);
+}
+
 /** Font chain. The comma form is a pango fallback chain resolved per character, so latin glyphs
  *  can come from one family and CJK from another. */
 constexpr const char* kFontChain = "Noto Sans CJK SC,Sarasa Mono CL,DejaVu Sans,sans-serif";
@@ -80,6 +93,9 @@ void usage(std::FILE* out) {
       "                     so prefer --cookie-file.\n"
       "  --cookie-file PATH Read the cookie from a file instead; recommended, since the file can\n"
       "                     be chmod 600 and the value never reaches the process arguments.\n"
+      "                     A leading ~ is expanded to $HOME, which matters for the systemd unit:\n"
+      "                     systemd does not do it, so the unit writes %%h and this is belt and\n"
+      "                     braces.\n"
       "  --font NAME[,...]  Font family chain for the panel, default a CJK-capable fallback chain\n"
       "  --font-size N      Chat text size in px, for the username and the body. Default 28.\n"
       "                     The avatar box follows it: it is always one line tall.\n"
@@ -624,8 +640,12 @@ int main(int argc, char** argv) {
                  "         can read it from ps(1). Prefer --cookie-file with a chmod 600 file.\n");
   }
   if (!o.cookieFile.empty()) {
+    o.cookieFile = expandTilde(o.cookieFile);
     std::FILE* f = std::fopen(o.cookieFile.c_str(), "rb");
     if (!f) {
+      // The resolved path, not the argument: the argument may have been a ~ that this process
+      // expanded, and printing the unresolved form sends whoever is reading the log looking for
+      // a file at a path that cannot exist.
       std::fprintf(stderr, "cannot read cookie file: %s\n", o.cookieFile.c_str());
       return 1;
     }

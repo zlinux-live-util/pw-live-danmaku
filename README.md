@@ -98,7 +98,7 @@ chmod 600 ~/.config/pw-live-danmaku/cookie
 | --- | --- | --- |
 | `--room ID\|URL` | 必填 | 房间号或直播间 URL；`b23.tv` 短链也能解析 |
 | `--cookie STR` | | cookie 字符串。会进 `ps(1)`，程序会警告 |
-| `--cookie-file PATH` | | 从文件读 cookie（推荐，可 `chmod 600`） |
+| `--cookie-file PATH` | | 从文件读 cookie（推荐，可 `chmod 600`）。开头的 `~` 会展开为 `$HOME` |
 | `--font NAME[,...]` | CJK 回退链 | pango 逐字符回退，拉丁与中文字体可以串成一条链 |
 | `--font-size N` | `28` | 聊天区字号（用户名与正文）。头像框随之为一行文字高 |
 | `--card-font-size N` | `30` | 醒目留言 / 舰长卡片内的字号 |

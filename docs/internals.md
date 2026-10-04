@@ -303,6 +303,14 @@ libcurl 8.x 其实带 WebSocket 支持（`curl_ws_recv` / `curl_ws_send` 符号�
 
 `--cookie` 与 `--cookie-file` 互斥；`--room` 缺失、两者同时给、cookie 文件读不到，都返回非零退出码（**绝不会是 0**，否则 systemd `Restart=always` 下会变成静默重启循环并报告 SUCCESS）。
 
+### 为什么自己展开 `~`
+
+`--cookie-file` 会把开头的 `~` 展开为 `$HOME`，尽管 shell 已经展开过一次。这不是冗余：shell 里的 `~` 是 shell 的功能，从不经过程序，所以它对 systemd 写的 unit 一无所知。unit 里写 `--cookie-file ~/.config/...` 时，systemd 把 `~` 原样交给程序，程序按字面路径 `~/.config/...` 去读，而 unit 的 `WorkingDirectory` 是 `$HOME`，于是它实际找的是 `$HOME/~/.config/...` —— 一个不可能存在的路径。
+
+这个坑的实际后果不是一次报错，而是每3 秒一次崩溃重启：程序退出 1，`Restart=on-failure` + `RestartSec=3` 把它拉起来，再崩，再拉。`StartLimitBurst` 的默认值（10 秒内 5 次）拦不住它，因为每次重试本身也在消耗配额，窗口永远不满。现在 unit 里显式写了 `StartLimitIntervalSec=60` / `StartLimitBurst=5`，5 次失败后就停住并保持 failed，等人来看。
+
+unit 自己的 `ExecStart` 写的是 `%h`（systemd 的 home 目录 specifier），不是 `~`；程序侧的展开是双保险。两者都要，因为 `%h` 只有 unit 能用，而程序侧的展开让同一份参数在任何来源下含义一致。
+
 ## `DANMU_MSG` 的真实结构（M1 实测）
 
 抓一条真实弹幕，`info` 有 **18** 个元素，实测输出：

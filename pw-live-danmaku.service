@@ -3,8 +3,20 @@ Description=bilibili live chat as a PipeWire video node
 Documentation=https://github.com/zlinux-live-util/pw-live-danmaku
 After=pipewire.service wireplumber.service
 
+# The default StartLimitBurst of 5 in 10s does not stop this unit from looping forever on
+# RestartSec=3; the burst never elapses because every retry is itself a retry. So bound it
+# explicitly: five failed starts and it gives up and stays failed until the next `systemctl
+# --user start`, which is the point at which a human is looking. A wrong argument or a missing
+# cookie file is not something more attempts can fix.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
+# Paths in ExecStart use the systemd %h specifier, never `~`. systemd does not expand `~` and
+# hands it to the program as a literal byte, which resolves against the unit's WorkingDirectory
+# ($HOME) as $HOME/~ -- a path that cannot exist. The program now expands `~` itself, so either
+# spelling works; %h is still the right thing to write here because it needs no help.
 ExecStart=@REPO@/pw-live-danmaku @ARGS@
 Restart=on-failure
 RestartSec=3
@@ -20,8 +32,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The cookie file (if used) is read at startup from $HOME.
-ReadOnlyPaths=%h/.config/pw-live-danmaku
+# The cookie file (if used) is read at startup from $HOME. The `-` prefix matters: without it a
+# user who never configures a cookie has no such directory, and systemd then fails the unit before
+# ExecStart rather than letting the program run without one. The cookie is optional; the unit
+# should not make it a precondition.
+ReadOnlyPaths=-%h/.config/pw-live-danmaku
 
 [Install]
 WantedBy=default.target
