@@ -117,6 +117,19 @@ uint32_t Panel::nameColor(UserType t) const {
   }
 }
 
+double Panel::rowAlpha(MsgKind k) const {
+  return (k == MsgKind::Entry || k == MsgKind::Like) ? tok_.dimAlpha : 1.0;
+}
+
+double Panel::textX(MsgKind k) const {
+  return hasAvatarBox(k) ? tok_.padX + avatarBox() + tok_.avatarGap : tok_.padX;
+}
+
+uint32_t Panel::barColor(const Message& m) const {
+  if (m.kind == MsgKind::Gift) return tok_.barGift;
+  return barColor(m.type);
+}
+
 std::vector<Panel::CardLine> Panel::cardLines(const Message& m, cairo_t* cr, double w) const {
   pwvideo::LabelSpec spec;
   spec.family = tok_.font;
@@ -150,9 +163,9 @@ double Panel::cardHeight(const Message& m, cairo_t* cr, double w) const {
   return content + tok_.rowGap * 3.0;
 }
 
-double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
-  const bool card = m.kind != MsgKind::Text;
-  if (isCard) *isCard = card;
+double Panel::measureRow(const Message& m, cairo_t* cr, bool* cardOut) const {
+  const bool card = isCard(m.kind);
+  if (cardOut) *cardOut = card;
   if (card) {
     return cardHeight(m, cr, static_cast<double>(width_));
   }
@@ -172,8 +185,7 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* isCard) const {
   int nw = 0, nh = 0;
   pango_layout_get_pixel_size(text_.layout(cr, m.user + ":", ns), &nw, &nh);
 
-  const double textX = tok_.padX + avatarBox() + tok_.avatarGap;
-  const double avail = static_cast<double>(width_) - textX - tok_.padRight;
+  const double avail = static_cast<double>(width_) - textX(m.kind) - tok_.padRight;
 
   spec.sizePx = tok_.fontBody;
   // The gap after "name:" is part of what the first line has to fit, so it is subtracted here as
@@ -259,7 +271,8 @@ void Panel::drawAvatars(cairo_t* cr) const {
   }
 }
 
-void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline) const {
+double Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline,
+                        double alpha) const {
   const double d = tok_.emote;
   // Bottom edge on the line's baseline, which is what vertical-align: baseline does to an inline
   // image: nothing of the box hangs below the baseline and the whole of it stands above. baseline is
@@ -281,9 +294,16 @@ void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, 
     ls.sizePx = tok_.fontBody;
     ls.maxLines = 1;
     PangoLayout* l = text_.layout(cr, f.text, ls);
-    pwvideo::TextRenderer::outline(cr, l, x, lineTop, tok_.outline, rgb(tok_.outlineColor, 0.85));
-    pwvideo::TextRenderer::fill(cr, l, x, lineTop, rgb(tok_.body));
-    return;
+    int rw = 0, rh = 0;
+    pango_layout_get_pixel_size(l, &rw, &rh);
+    // The halo scales with the row's alpha here too, for the same reason as in outlined() below.
+    pwvideo::TextRenderer::outline(cr, l, x, lineTop, tok_.outline,
+                                   rgb(tok_.outlineColor, 0.85 * alpha));
+    pwvideo::TextRenderer::fill(cr, l, x, lineTop, rgb(tok_.body, alpha));
+    // The advance is however wide that text actually is, not the emote box. A token can be far wider
+    // than the box it stands in -- a gift name of three CJK characters at the body size is about
+    // three times it -- and advancing by the box drew the next run straight on top of it.
+    return std::max(d, static_cast<double>(rw));
   }
 
   cairo_save(cr);
@@ -299,8 +319,13 @@ void Panel::drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, 
   } else {
     cairo_set_source_rgba(cr, 0.45, 0.45, 0.5, 1.0);
   }
-  cairo_paint(cr);
+  // The row's alpha goes on the paint, not just on the text beside it. Without this a picture on a
+  // dimmed row drew at full strength while the words around it were pushed down, which is the
+  // opposite of what a dimmed row is for -- and no kind carries both today, so it would have been the
+  // first thing to break the day one does.
+  cairo_paint_with_alpha(cr, alpha);
   cairo_restore(cr);
+  return d;
 }
 
 double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double w) const {
@@ -310,11 +335,16 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   spec.bold = true;
 
   const auto outlined = [&](PangoLayout* l, double lx, double ly, const pwvideo::Rgba& col) {
-    pwvideo::TextRenderer::outline(cr, l, lx, ly, tok_.outline, rgb(tok_.outlineColor, 0.85));
+    // The halo scales with the row's alpha as well as the fill. It is drawn under the glyph, so
+    // leaving it at full strength while the fill went to dimAlpha kept a hard black edge around
+    // half-bright text -- and on a bright video that edge is more visible than the dimmed fill it
+    // was meant to be framing, which is precisely the opposite of pushing a row back.
+    pwvideo::TextRenderer::outline(cr, l, lx, ly, tok_.outline,
+                                   rgb(tok_.outlineColor, 0.85 * col.a));
     pwvideo::TextRenderer::fill(cr, l, lx, ly, col);
   };
 
-  if (m.kind != MsgKind::Text) {
+  if (isCard(m.kind)) {
     // Membership card opaque, paid card lighter, so a stack of them does not become a slab.
     // Bilibili's cyan is not in the reference stylesheet, hence here rather than in the tokens.
     const pwvideo::Rgba bg = m.kind == MsgKind::Membership
@@ -354,8 +384,12 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   // arrives after this row has been laid out still appears; baking it here would freeze whatever
   // was in the cache at that instant, which is usually the placeholder disc.
 
-  const double textX = x + tok_.padX + avatarBox() + tok_.avatarGap;
-  const double avail = w - textX - tok_.padRight;
+  // A row with no avatar (an entry notice) starts its text at the padding instead, and the ambient
+  // kinds are drawn dimmed with no bar: see hasAvatarBox()/hasBar()/rowAlpha() in panel.hpp for why
+  // those three decisions go together.
+  const double tx = textX(m.kind);
+  const double avail = w - tx - tok_.padRight;
+  const double alpha = rowAlpha(m.kind);
 
   // The name is measured rather than assumed: it can be latin or CJK, and the widths differ enough
   // that a fixed offset would visibly misalign the body.
@@ -368,9 +402,9 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   pango_layout_get_pixel_size(nl, &nw, &nh);
 
   double ty = y;
-  outlined(nl, textX, ty, rgb(nc));
+  outlined(nl, tx, ty, rgb(nc, alpha));
 
-  const double bodyX = textX + nw + tok_.nameBodyGap;
+  const double bodyX = tx + nw + tok_.nameBodyGap;
   // Emotes become object-replacement characters before layout, so pango does the line breaking and
   // places the placeholders. Each visual line is then split back at them and drawn as text runs
   // and pictures in a single pass.
@@ -389,8 +423,8 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   // height is the line count -- and it cannot be painted over, being 4px from the edge while the
   // text starts at padX. The margin below the row is left out on purpose: that is the gap to the
   // next message, and a bar reaching into it would read as belonging to both rows.
-  {
-    const pwvideo::Rgba bar = rgb(barColor(m.type), m.type == UserType::Normal ? 0.5 : 1.0);
+  if (hasBar(m.kind)) {
+    const pwvideo::Rgba bar = rgb(barColor(m), m.type == UserType::Normal ? 0.5 : 1.0);
     cairo_set_source_rgba(cr, bar.r, bar.g, bar.b, bar.a);
     // Square corners: the bar is flush against the panel edge, so rounding its ends would only
     // carve notches out of the very edge it is meant to sit on.
@@ -452,11 +486,10 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
         PangoLayout* rl = text_.layout(cr, run, ls);
         int rw = 0, rh = 0;
         pango_layout_get_pixel_size(rl, &rw, &rh);
-        outlined(rl, x, ty, rgb(tok_.body));
+        outlined(rl, x, ty, rgb(tok_.body, alpha));
         x += rw;
       }
-      drawEmote(cr, m.parts[em.second], x, ty, baseline);
-      x += tok_.emote;
+      x += drawEmote(cr, m.parts[em.second], x, ty, baseline, alpha);
       cursor = em.first + kEmoteCharLen;  // step over the placeholder itself
     }
     if (cursor < end) {
@@ -464,7 +497,7 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
       pwvideo::LabelSpec ls = spec;
       ls.sizePx = tok_.fontBody;
       ls.maxLines = 1;
-      outlined(text_.layout(cr, run, ls), x, ty, rgb(tok_.body));
+      outlined(text_.layout(cr, run, ls), x, ty, rgb(tok_.body, alpha));
     }
     ty += lh;
   }
@@ -516,7 +549,7 @@ void Panel::rebuildLayer(const std::vector<Message>& msgs) {
   double y = static_cast<double>(height_) - total;
   for (size_t i = 0; i < msgs.size(); ++i) {
     paintRow(lc, msgs[i], 0.0, y, static_cast<double>(width_));
-    rows_.push_back(Row{count_++, contentH_, hs[i], msgs[i].kind != MsgKind::Text, msgs[i].avatarUrl});
+    rows_.push_back(Row{count_++, contentH_, hs[i], isCard(msgs[i].kind), msgs[i].avatarUrl});
     contentH_ += hs[i];
     y += hs[i];
   }

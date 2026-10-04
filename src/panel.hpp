@@ -66,6 +66,16 @@ struct PanelTokens {
   uint32_t barMember = 0x0F9D58;
   uint32_t barModerator = 0x5E84F1;
   uint32_t barOwner = 0xFFD600;
+  // A gift is not one of the four author types, so its bar has no --username-color to come from.
+  // Bilibili's gift accent is a warm gold; the reference stylesheet has no token for it, so it is
+  // set here rather than in the site implementation, the same way the paid card's cyan is.
+  uint32_t barGift = 0xF5C542;
+
+  /** How far down the two ambient kinds -- entry notices and likes -- are drawn. They have the same
+   *  shape as a chat row and the same outline, so without this they compete with what was actually
+   *  typed for the same attention. Their arrival rates differ from chat's by more than an order of
+   *  magnitude, so the visual weight has to differ by more than a shade. */
+  double dimAlpha = 0.5;
 
   // --username-color, per author type. Ordinary names sit well below the body white: the name
   // repeats on every row, so at body brightness the column reads as solid text.
@@ -198,16 +208,48 @@ class Panel {
    *  arriving after its row was laid out appears without the row having to be redrawn. */
   void drawAvatars(cairo_t* cr) const;
   /** Draws one inline emote into a box on the current line, or the token as text when the picture
-   *  has not arrived yet or the platform gave no URL for it.
+   *  has not arrived yet or the platform gave no URL for it. Returns how far the line advanced.
    *
    *  lineTop is the top of the line's box, the same value every text run on the line is drawn at.
    *  baseline is how far below that top pango puts the baseline, which depends on the font that
    *  answered and is measured rather than derived; the emote's bottom edge is aligned to the
-   *  baseline, the way vertical-align: baseline aligns an inline image. */
-  void drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline) const;
+   *  baseline, the way vertical-align: baseline aligns an inline image. alpha is the row's own
+   *  alpha, so a picture on a dimmed row dims with the words beside it.
+   *
+   *  The advance is the picture's box when there is a picture, and the measured width of the token
+   *  when there is not -- a token can be much wider than the box, and returning the box either way
+   *  drew whatever came next on top of it. */
+  double drawEmote(cairo_t* cr, const Fragment& f, double x, double lineTop, double baseline,
+                   double alpha) const;
   pwvideo::Rgba rgb(uint32_t c, double alpha = 1.0) const;
   uint32_t barColor(UserType t) const;
   uint32_t nameColor(UserType t) const;
+
+  /** Whether a row leaves room for an avatar.
+   *
+   *  Entry notices do not: they arrive several times a second and every one is a different viewer,
+   *  so the column would become a strip of single-use faces that the avatar cache can never keep,
+   *  and most of them would be the site's default picture besides. */
+  static bool hasAvatarBox(MsgKind k) { return k != MsgKind::Entry; }
+
+  /** Whether a row is drawn with the coloured bar at the panel edge. The two ambient kinds are not:
+   *  the bar is the loudest thing in a row, and these rows exist to sit under the chat rather than
+   *  in it. A gift keeps one, because it is something a viewer paid for. */
+  static bool hasBar(MsgKind k) { return k != MsgKind::Entry && k != MsgKind::Like; }
+
+  /** Alpha the name and body of this kind are drawn at: dimAlpha for the ambient kinds, 1.0 for the
+   *  rest. Applied to the name as well as the body, or a dimmed row would still show a full-bright
+   *  nickname column, and to the text halo as well, or a dimmed row would still show a full-strength
+   *  black edge around half-bright glyphs. */
+  double rowAlpha(MsgKind k) const;
+
+  /** Left edge of the text in a row: past the avatar box when the row has one, at the padding when
+   *  it does not. measureRow() and paintRow() both go through here, because a disagreement between
+   *  them about where the text starts is exactly how a row ends up allocated short and overwritten. */
+  double textX(MsgKind k) const;
+
+  /** The bar colour for a row: the gift accent for a gift, the author type's colour otherwise. */
+  uint32_t barColor(const Message& m) const;
 
   PanelTokens tok_;
   ImageStore* avatars_ = nullptr;

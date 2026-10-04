@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "http.hpp"  // submodule: pwvideo::HttpClient
+#include "pb.hpp"    // the schema-less protobuf reader behind data.pb
 
 namespace dwm {
 namespace {
@@ -494,6 +495,70 @@ std::string httpsUrl(const std::string& url) {
   return "https://" + url.substr(strlen(kPlain));
 }
 
+/** Decodes base64, standard or URL-safe. False on anything that is not clean base64.
+ *
+ *  EVP_DecodeBlock wants a NUL-terminated buffer and does not skip whitespace, so both are dealt
+ *  with here. The `pb` field arrives as one unbroken line, but the value is data from the network
+ *  and a stray newline must not turn a perfectly good event into a dropped one.
+ *
+ *  The two alphabets are folded into one here rather than left to fail. `EVP_DecodeBlock` rejects
+ *  `-` and `_`, so a payload that arrived URL-safe encoded would decode to nothing and both
+ *  protobuf events would be dropped -- silently, and with exactly the symptom this milestone was
+ *  built to eliminate: a panel that looks like it is not being sent anything. Three characters of
+ *  translation buy the whole feature immunity to that one packaging change.
+ *
+ *  OpenSSL rather than hand-rolled because it is already a dependency of this file (md5, and the
+ *  TLS layer) and a base64 decoder is exactly the kind of thing that has four subtly different
+ *  implementations to choose between. */
+bool base64Decode(std::string_view in, std::string& out) {
+  std::string packed;
+  packed.reserve(in.size());
+  for (const char ch : in) {
+    if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+    // URL-safe alphabet back onto the standard one. Only these two differ; `=` padding is shared.
+    if (ch == '-') {
+      packed.push_back('+');
+      continue;
+    }
+    if (ch == '_') {
+      packed.push_back('/');
+      continue;
+    }
+    packed.push_back(ch);
+  }
+  // Four characters encode three bytes; anything else cannot be a whole number of groups.
+  if (packed.empty() || packed.size() % 4 != 0) {
+    out.clear();
+    return false;
+  }
+  out.assign(packed.size() / 4 * 3 + 1, '\0');
+  const int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(out.data()),
+                                reinterpret_cast<const unsigned char*>(packed.data()),
+                                static_cast<int>(packed.size()));
+  if (n < 0) {
+    out.clear();
+    return false;
+  }
+  size_t len = static_cast<size_t>(n);
+  // EVP_DecodeBlock counts the padding as if it carried data, so it reports up to two bytes more
+  // than the payload really holds. Strip them rather than letting the protobuf reader meet two
+  // zero bytes of noise at the end of the message.
+  if (packed.back() == '=') --len;
+  if (packed.size() >= 2 && packed[packed.size() - 2] == '=') --len;
+  out.resize(len);
+  return true;
+}
+
+/** The body of an entry row.
+ *
+ *  One person reads as a plain verb; several read as a count, named after the first of them. The
+ *  count is of *all* the people the row stands for, including the one it is named after, so the
+ *  rows of a stream add up to the number of people who actually walked in. */
+std::string entryBody(int count) {
+  if (count <= 1) return "进入了直播间";
+  return "等 " + std::to_string(count) + " 人进入了直播间";
+}
+
 }  // namespace
 
 void Bili::splitFragments(const std::string& text,
@@ -607,6 +672,102 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     return true;
   }
 
+  // Two of the events stopped being JSON. INTERACT_WORD_V2 (somebody entered the room) and
+  // SEND_GIFT_V2 (a gift) now carry exactly one field besides `cmd` and `dmscore`: `data.pb`, a
+  // base64 protobuf message. That is the whole payload, so a reader that only knew about JSON saw
+  // these documents as empty and dropped them -- which is what happened before this milestone, and
+  // why the events looked like a network problem rather than a parser one.
+  if (cmd == "INTERACT_WORD_V2") {
+    std::string blob;
+    if (!base64Decode(json["data"]["pb"].str(), blob)) return false;
+    const pb::Message root(blob);
+    // Field 2 is the nickname, 8 the millisecond timestamp. Both were present in 110 of 110
+    // captures in room 21852; the field numbers are pinned by tests/bili_test.cpp.
+    out.user = std::string(root.str(2));
+    // A row with no nickname has nothing to identify the viewer with, so it is dropped rather than
+    // shown as an unattributed notice.
+    if (out.user.empty()) return false;
+    out.kind = MsgKind::Entry;
+    out.tsMs = static_cast<int64_t>(root.num(8));
+    out.parts.push_back(Fragment{Fragment::Kind::Text, entryBody(1), "", 0});
+    // No face on purpose. The one is at field 22.2.2, and it is not read: entries arrive several
+    // times a second and each is a different viewer, so the column would be a strip of
+    // single-use faces the avatar cache could never keep -- mostly the site's default one.
+    return true;
+  }
+
+  if (cmd == "SEND_GIFT_V2") {
+    std::string blob;
+    if (!base64Decode(json["data"]["pb"].str(), blob)) return false;
+    const pb::Message root(blob);
+    // Field 10 is the gift itself: 1 the id, 2 the name, 3 how many, 5 the price in gold, 10 the
+    // send time in seconds, 18 the verb the site chose for this gift, 35 the picture (1 a PNG,
+    // 2 a webp). Field 2 is the sender and 3 the sender's face. Field 13.1 is how many of this
+    // gift the sender has given inside the current combo run, which is not this message's own
+    // count and so is not what the row shows.
+    const pb::Message gift = root.sub(10);
+    const std::string giftName(gift.str(2));
+    // Dropped without a name: the row would have nothing on it but the verb, because the picture
+    // is only a picture -- and the renderer falls back to the name when it is still downloading.
+    if (giftName.empty()) return false;
+    out.user = std::string(root.str(2));
+    if (out.user.empty()) return false;
+
+    out.kind = MsgKind::Gift;
+    out.avatarUrl = httpsUrl(std::string(root.str(3)));
+    out.tsMs = static_cast<int64_t>(gift.num(10)) * 1000;
+
+    std::string verb(gift.str(18));
+    if (verb.empty()) verb = "送出";  // measured as "投喂" on every capture, one gift family
+    out.parts.push_back(Fragment{Fragment::Kind::Text, verb + " ", "", 0});
+
+    Fragment icon;
+    icon.kind = Fragment::Kind::Emote;
+    // Carried as an emote fragment rather than as a new field: the picture sits in the text flow
+    // next to the name, which is exactly what a Fragment is, and it is fetched and cached by the
+    // same store as the emotes -- a small closed set that every viewer in the room reuses.
+    icon.text = giftName;
+    // Field 1 only. Field 2 is the same picture as a webp and is not read even when 1 is missing:
+    // whether gdk-pixbuf can decode one depends on the distribution's pixbuf loaders, so taking it
+    // would make the icon work on some machines and silently fail on others. With no URL the
+    // fragment falls back to the gift name, which is a row that still reads.
+    const pb::Message info = gift.sub(35);
+    icon.url = httpsUrl(std::string(info.str(1)));
+    out.parts.push_back(std::move(icon));
+
+    const uint64_t count = gift.num(3);
+    if (count > 1)
+      out.parts.push_back(Fragment{Fragment::Kind::Text, " ×" + std::to_string(count), "", 0});
+    return true;
+  }
+
+  if (cmd == "LIKE_INFO_V3_CLICK") {
+    // The one of the three that still arrives as JSON, and the only one whose nickname is *not*
+    // masked on an anonymous connection: 6 of 6 captures here had a real name, against 106 of 110
+    // masked on the entry notices from the same socket. Whatever the inconsistency is, this event
+    // hands the name over, so it is the one place a masked room still names its viewers.
+    const Json& d = json["data"];
+    out.user = d["uname"].str();
+    if (out.user.empty()) out.user = d["uinfo"]["base"]["name"].str();
+    if (out.user.empty()) return false;
+    out.kind = MsgKind::Like;
+    out.avatarUrl = httpsUrl(d["uinfo"]["base"]["face"].str());
+    // like_text was "为主播点赞了" on every capture; it is a field rather than a constant here
+    // because the site does vary it (a mystery viewer's like reads differently), and a constant
+    // would quietly discard that.
+    std::string text = d["like_text"].str();
+    if (text.empty()) text = "为主播点赞了";
+    out.parts.push_back(Fragment{Fragment::Kind::Text, text, "", 0});
+    // tsMs is left at 0 on purpose, and this is the one handler that does not set it: none of the
+    // captures carried a time field, so any value here would be invented. Nothing reads it for this
+    // kind -- the dwell clock only ever sees MsgKind::Paid -- so an unset timestamp costs nothing
+    // here, whereas a guessed one would be a wrong number nothing could correct later.
+    // uinfo.guard.level is the guard tier and would set UserType::Member. Not read: every capture
+    // had 0, so the mapping from that field's non-zero values is a guess, and this project does not
+    // record guesses. See docs/internals.md.
+    return true;
+  }
+
   // The two card kinds below follow the documented field tables but have not yet been observed on
   // this machine, so every field is read optionally: a document that does not match yields a
   // message with less in it rather than being dropped.
@@ -652,6 +813,40 @@ bool Bili::parseMessage(const Json& json, Message& out) {
   }
 
   return false;
+}
+
+bool EntryMerger::flush(int64_t nowMs, Message& out) {
+  if (windowMs_ > 0 && nowMs < nextRowAtMs_) return false;
+  if (!flushAll(out)) return false;
+  // The next window starts when the row went out, and only once it has: an empty flush must not
+  // open a window that then swallows the notices arriving immediately after it.
+  if (windowMs_ > 0) nextRowAtMs_ = nowMs + windowMs_;
+  return true;
+}
+
+bool EntryMerger::flushAll(Message& out) {
+  if (pending_ == 0) return false;
+
+  // The row stands for every notice since the previous one, and it is named after the first of
+  // them. The count therefore includes the one named on the row, which is what makes the rows of a
+  // stream add up to the number of people who walked in rather than to something one less each.
+  out = head_;
+  out.parts.clear();
+  out.parts.push_back(Fragment{Fragment::Kind::Text, entryBody(pending_), "", 0});
+
+  if (windowMs_ > 0) {
+    pending_ = 0;
+    // head_ is deliberately left alone: it is unreachable the moment pending_ hits 0, because
+    // push() overwrites it before the next notice is counted, so clearing it would cost a Message
+    // assignment per window for nothing. flushAll() has no clock and so no cooldown to move -- that
+    // is flush()'s job, and at end of stream there is no next window to start.
+  } else {
+    // Unmerged: one notice in, one row out, so a burst still produces a row for each of them and
+    // the next push starts a fresh head. head_ is only cleared once it has been used up, which is
+    // what stops the second notice of a burst being labelled with the first one's name.
+    if (--pending_ == 0) head_ = Message();
+  }
+  return true;
 }
 
 }  // namespace dwm

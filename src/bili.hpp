@@ -126,13 +126,28 @@ class Bili {
                          size_t maxOut = 64u * 1024u * 1024u);
 
   /** Turns one command document into a Message. Returns false for anything that is not a message
-   *  meant for the chat panel, which is most of the stream: entry notices, rank changes, gift and
-   *  membership events this milestone does not render yet. That is not an error.
+   *  meant for the chat panel, which is still most of the stream: rank changes, watched counters,
+   *  the aggregate "N people are liking" toasts, the login notice. That is not an error.
    *
-   *  DANMU_MSG is measured and verified; see docs/internals.md. The card kinds are read from the
-   *  documented field tables but have not yet been observed on this machine, so every field there
-   *  is optional and a document that does not match simply produces a message with less in it
-   *  rather than being dropped. */
+   *  Six commands are read. Three of them are measured on this machine and verified:
+   *
+   *    DANMU_MSG           a typed chat line
+   *    INTERACT_WORD_V2    somebody entered the room   (protobuf, see below)
+   *    SEND_GIFT_V2        somebody sent a gift         (protobuf, see below)
+   *    LIKE_INFO_V3_CLICK  somebody liked the stream
+   *
+   *  and the two card kinds follow the documented field tables but have not yet been observed here:
+   *    SUPER_CHAT_MESSAGE, GUARD_BUY
+   *
+   *  Every field is read optionally throughout, so a document that does not match yields a message
+   *  with less in it rather than being dropped -- except where a row without it would have nothing
+   *  on it to draw, which is noted at each site.
+   *
+   *  INTERACT_WORD_V2 and SEND_GIFT_V2 no longer carry JSON. Both now send a single base64 field,
+   *  `data.pb`, that decodes to a protobuf message with no published schema; the field numbers read
+   *  here were measured off the wire and are pinned by tests/bili_test.cpp. This is the one place in
+   *  the project that decodes protobuf, and it does so through src/pb.hpp rather than a generated
+   *  class, because there is no schema to generate one from. */
   static bool parseMessage(const Json& json, Message& out);
 
   /** Splits a body into text and emote fragments using the platform's advertised token map. */
@@ -165,6 +180,69 @@ class Bili {
   mutable std::string mixinKey_;
   mutable std::string cookie_;
   mutable bool cookieBuilt_ = false;
+};
+
+/** Folds the entry notices into one row per window.
+ *
+ *  Measured in room 21852, about a million watchers: 110 INTERACT_WORD_V2 in 70 s against 25
+ *  DANMU_MSG. Entries outnumber chat better than four to one, so a row each does not add
+ *  information to the panel -- it pushes four fifths of what was actually typed off the top. The
+ *  notices received since the last row are therefore shown together, named for the first of them
+ *  and counted, which is what the site's own entry panel does with the same stream.
+ *
+ *  A window of 0 turns this off, and then every notice gets its own row exactly as it arrives. That
+ *  is kept as a real option rather than treated as the degenerate case, because it is the honest
+ *  way to see the raw event rate, which is what the decision above was based on.
+ *
+ *  Clock-driven rather than count-driven on purpose: a count threshold would still let a busy
+ *  stretch put a burst on screen, and the crowding is a matter of how fast rows arrive, not of how
+ *  many there are in total. */
+class EntryMerger {
+ public:
+  /** The window used when --entry-merge is not given. The single source of that number: the
+   *  command line's own default reads it from here, so the two cannot drift apart the first time
+   *  one of them is edited. */
+  static constexpr int64_t kDefaultWindowMs = 5000;
+
+  explicit EntryMerger(int64_t windowMs = kDefaultWindowMs) : windowMs_(windowMs) {}
+
+  int64_t windowMs() const { return windowMs_; }
+
+  /** Feeds one entry notice and asks whether a row is due. Fills out and returns true when it is.
+   *
+   *  Note that a true result does not mean *this* notice is what gets drawn: when a batch is
+   *  pending, the row drawn is the summary of the batch, and this notice is counted into it. */
+  bool push(const Message& entry, int64_t nowMs, Message& out) {
+    if (pending_ == 0) head_ = entry;
+    ++pending_;
+    return flush(nowMs, out);
+  }
+
+  /** Publishes a batch whose window has elapsed, without waiting for another notice to arrive.
+   *
+   *  The read loop calls this on every wake-up, so a batch is never more than one read deadline
+   *  late -- without it, the last few entries of a burst would stay uncounted until the next viewer
+   *  walked in, which in a quiet room could be never. */
+  bool flush(int64_t nowMs, Message& out);
+
+  /** Publishes whatever is pending right now, window or no window.
+   *
+   *  For the end of the stream, where waiting is no longer an option: once the socket is gone no
+   *  further notice will ever arrive to close the batch, and the people in it did walk in. Folding
+   *  them away at that point would make the row count disagree with the number of viewers the
+   *  panel actually saw, which is the one thing the row exists to be accurate about. */
+  bool flushAll(Message& out);
+
+  /** Notices received since the last row was drawn. Diagnostics and tests only. */
+  int pending() const { return pending_; }
+
+ private:
+  int64_t windowMs_;
+  /** Earliest time the next row may be drawn. Zero before the first one, which is in the past. */
+  int64_t nextRowAtMs_ = 0;
+  int pending_ = 0;
+  /** The notice the next row is named after: the first of the batch. */
+  Message head_;
 };
 
 }  // namespace dwm

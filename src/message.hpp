@@ -25,6 +25,12 @@ namespace dwm {
 /** Role colouring, in the reference stylesheet's order of precedence. */
 enum class UserType { Normal, Member, Moderator, Owner };
 
+/** What a message is, which decides both where it is drawn and how loud it is.
+ *
+ *  The two paid kinds are cards; the three at the bottom are ordinary rows in the chat column that
+ *  carry an event instead of a typed body. They are here rather than being folded into Text because
+ *  a viewer reads them differently -- "somebody said this" versus "somebody did this" -- and the
+ *  panel dims the ambient ones so they do not crowd out what was actually typed. */
 enum class MsgKind {
   /** An ordinary chat line. */
   Text,
@@ -32,7 +38,21 @@ enum class MsgKind {
   Paid,
   /** A membership purchase (billibili GUARD_BUY / twitch sub). */
   Membership,
+  /** A gift (billibili SEND_GIFT_V2 / twitch cheer). Drawn like chat, with its own bar colour. */
+  Gift,
+  /** Somebody entered the room (billibili INTERACT_WORD_V2). Ambient: dimmed, no bar, no avatar. */
+  Entry,
+  /** Somebody liked the stream (billibili LIKE_INFO_V3_CLICK). Ambient, but the face is kept: the
+   *  site's own like notice shows one, and a like is deliberate rather than incidental. */
+  Like,
 };
+
+/** Whether a kind is a card: the two paid kinds, and only those.
+ *
+ *  A free function rather than a member because an enum class cannot carry one. It also keeps the
+ *  question explicit at every call site -- "is this row a card" is exactly the kind of test where an
+ *  earlier `kind != Text` quietly turned three new kinds into cards. */
+constexpr bool isCard(MsgKind k) { return k == MsgKind::Paid || k == MsgKind::Membership; }
 
 struct Fragment {
   enum class Kind { Text, Emote };

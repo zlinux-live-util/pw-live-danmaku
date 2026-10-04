@@ -56,8 +56,9 @@ constexpr size_t kMaxPerFrame = 40;
  *  would accumulate every message that arrived. */
 constexpr size_t kPendingCap = 400;
 
-/** How many messages --dump waits for when --count was not given: enough for the panel to show
- *  something worth looking at, few enough to stay quick. */
+/** How many rows --dump waits for when --count was not given: enough for the panel to show
+ *  something worth looking at, few enough to stay quick. Rows, not documents -- the same thing
+ *  --count counts, so a folded entry notice does not bring the dump closer to being taken. */
 constexpr int kDumpMessages = 6;
 
 PanelTokens defaultTokens() {
@@ -86,6 +87,11 @@ void usage(std::FILE* out) {
       "                     Default 30, the same size the chat uses plus 2.\n"
       "  --font-file PATH   Register a font file (or a directory) with fontconfig at startup;\n"
       "                     repeatable. Without --font its own family name is used\n"
+      "  --entry-merge MS   Combine the entry notices into one row per this many milliseconds,\n"
+      "                     labelled with the number of people it stands for. Measured in a room\n"
+      "                     with a million watchers they arrive at 1.6/s against 0.36/s of chat,\n"
+      "                     so a row each pushes most of what was typed off the top. Default 5000;\n"
+      "                     0 gives every notice its own row as it arrives\n"
       "  --node NAME        PipeWire node name, default pw-live-danmaku\n"
       "  --desc TEXT        Node description (this is what the OBS dropdown shows), default\n"
       "                     \"Live Chat\"\n"
@@ -93,7 +99,9 @@ void usage(std::FILE* out) {
       "                     a smaller negotiated size is clipped, not scaled.\n"
       "  --fps N            Frame-rate ceiling, default 30\n"
       "  --dump FILE        Render one sample frame to PNG and exit\n"
-      "  --count N          Exit after receiving N messages (0 = never)\n"
+      "  --count N          Exit after drawing N rows (0 = never). Counts the rows that reach the\n"
+      "                     panel, so entry notices folded into a combined row by --entry-merge\n"
+      "                     do not count towards it\n"
       "  --seconds N        Exit after N seconds (0 = never)\n"
       "  --demo             Draw a fixed set of messages and no network at all, for tuning the\n"
       "                     layout without a live room. Overrides --room.\n"
@@ -112,6 +120,10 @@ struct Options {
   std::vector<std::string> fontFiles;
   std::string font;
   int width = 480, height = 1080, fps = 30, count = 0, seconds = 0;
+  // The default is EntryMerger's own rather than a literal here, so the number cannot drift between
+  // the two. Not clamped to a minimum: 0 is a real value meaning "no combining", so a lower bound
+  // would make it unreachable exactly when someone asks for it.
+  int entryMergeMs = static_cast<int>(EntryMerger::kDefaultWindowMs);
   // 0 means "not given", so an unset flag leaves PanelTokens' own default in place rather than
   // restating it here: the two would otherwise drift apart the first time one of them is edited.
   double fontSize = 0.0, cardFontSize = 0.0;
@@ -144,6 +156,8 @@ Args parseArgs(int argc, char** argv, Options& o) {
       o.cardFontSize = std::clamp(std::stod(next(i)), 8.0, 200.0);
     } else if (a == "--font-file") {
       o.fontFiles.push_back(next(i));
+    } else if (a == "--entry-merge") {
+      o.entryMergeMs = std::max(0, std::stoi(next(i)));
     } else if (a == "--node") {
       o.node = next(i);
     } else if (a == "--desc") {
@@ -232,10 +246,25 @@ void drain(Shared& sh, std::vector<Message>& out) {
   }
 }
 
+/** What --verbose prints in front of a message, so the log says which kind of row it was.
+ *
+ *  Needed since the kinds went past two: "anything that is not Text" printed [sub] for gifts,
+ *  entries and likes alike, which is worse than no tag because it looks like a classification. */
+const char* kindTag(MsgKind k) {
+  switch (k) {
+    case MsgKind::Paid: return "[paid] ";
+    case MsgKind::Membership: return "[sub] ";
+    case MsgKind::Gift: return "[gift] ";
+    case MsgKind::Entry: return "[entry] ";
+    case MsgKind::Like: return "[like] ";
+    default: return "";
+  }
+}
+
 void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImages,
-              const std::string& roomInput,
-              bool verbose, std::atomic<bool>& stop, pwvideo::VideoNode* video,
-              std::atomic<int>& received, int count) {
+              const std::string& roomInput, int entryMergeMs, bool verbose,
+              std::atomic<bool>& stop, pwvideo::VideoNode* video, std::atomic<int>& received,
+              int count) {
   try {
     sh.setState("resolving room");
     const int64_t roomId = bili.resolveRoom(roomInput);
@@ -305,6 +334,71 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
     if (verbose) std::fprintf(stderr, "[site] authenticated\n");
     sh.setState("streaming");
 
+    // Entry notices are folded into one row per window on the way out, so the policy lives with the
+    // only loop that has a clock. The other two event kinds need nothing like it: gifts and likes
+    // arrive an order of magnitude more slowly than chat and are passed through as they come.
+    EntryMerger entries(entryMergeMs);
+    if (verbose)
+      std::fprintf(stderr, "[site] entry notices: %s\n",
+                   (entryMergeMs > 0
+                        ? "combined into one row per " + std::to_string(entryMergeMs) + " ms"
+                        : std::string("one row each"))
+                       .c_str());
+
+    /** Hands one finished message to the render side. False once --count has been reached, which
+     *  is the forEachJson visitor's signal to stop walking this websocket message. */
+    auto publish = [&](Message m) {
+      // Entry notices carry no face on purpose -- one per viewer at 1.6/s is the wrong thing to
+      // spend an avatar cache on -- so they must not land in this counter. The counter answers
+      // "why is a row that has an avatar box showing a placeholder disc", and an entry notice has
+      // no avatar box to be wrong about.
+      if (m.kind != MsgKind::Entry) sh.noteAvatar(m.avatarUrl);
+      if (!m.avatarUrl.empty()) {
+        // A URL we already have means two users share one picture. When that picture is the site's
+        // default, several different people appear with the same flat disc, which reads as a
+        // rendering fault and is not one.
+        if (verbose && avatars.isCached(m.avatarUrl))
+          std::fprintf(stderr, "[avatar] shared pic: %s  (user %s)\n", m.avatarUrl.c_str(),
+                       m.user.c_str());
+        avatars.request(m.avatarUrl);
+      }
+      // Emotes are fetched from the platform's own CDN URLs, and so are gift pictures: both are a
+      // small set the whole room reuses all evening, unlike faces which are one per viewer. They go
+      // in a separate store for exactly that reason -- a bigger cache budget, and neither evicts
+      // the other.
+      for (const Fragment& part : m.parts) {
+        if (part.kind == Fragment::Kind::Emote && !part.url.empty()) emoteImages.request(part.url);
+      }
+      if (verbose)
+        std::fprintf(stderr, "[msg] %s%s: %s\n", kindTag(m.kind), m.user.c_str(),
+                     m.plainText().c_str());
+      sh.append(std::move(m));
+      const int n = received.fetch_add(1) + 1;
+      if (count > 0 && n >= count) {
+        if (verbose) std::fprintf(stderr, "[site] reached --count %d\n", count);
+        stop.store(true);
+        if (video) video->quit();
+        return false;
+      }
+      return true;
+    };
+
+    /** Publishes whatever entry notices are still batched, without waiting out the window.
+     *
+     *  For the paths where no further notice is ever coming -- the socket is gone, so nothing will
+     *  ever close the batch. Those people did walk in, and the rest of the panel is still on screen
+     *  showing whatever it rendered before the drop, so the row belongs in it: folding it away at
+     *  that point would make the row count disagree with the number of viewers the panel actually
+     *  saw, which is the one thing the row exists to be accurate about.
+     *
+     *  Deliberately silent when stopping: on SIGINT, --seconds or --count there is no point drawing
+     *  one more row, and the notice that tripped --count has already been refused by the window. */
+    auto publishPendingEntries = [&] {
+      if (stop.load()) return;
+      Message due;
+      if (entries.flushAll(due)) publish(std::move(due));
+    };
+
     // The read deadline is what drives the heartbeat timer: one thread, no second timer.
     int64_t nextHeartbeat = steadyMs() + 30000;
     while (!stop.load()) {
@@ -313,14 +407,28 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
       if (now >= nextHeartbeat) {
         nextHeartbeat = now + 30000;
         if (!ws.sendBinary(Bili::heartbeatPacket())) {
+          // A send that fails means the socket is gone, which is the same situation as a Close or
+          // an Error arriving: the same batch has to go out before leaving, or the reason depends
+          // on which of the three notices the socket happened to drop on.
           sh.setState("heartbeat failed: " + ws.lastError());
+          publishPendingEntries();
           return;
         }
       }
-      if (ev == WsClient::Event::Timeout) continue;
+      if (ev == WsClient::Event::Timeout) {
+        // A read deadline is the only clock this loop has, so it is also where a finished batch of
+        // entry notices gets published. Waiting for the next notice instead would leave the last
+        // few of a burst uncounted until somebody else walked in, which in a quiet room could be
+        // never -- the row would show up late or not at all, from a mechanism whose whole point is
+        // that it does not have to wait.
+        Message due;
+        if (!stop.load() && entries.flush(now, due)) publish(std::move(due));
+        continue;
+      }
       if (ev == WsClient::Event::Error || ev == WsClient::Event::Close) {
         sh.setState(std::string(ev == WsClient::Event::Close ? "closed by peer" : "error") + ": " +
                     ws.lastError());
+        publishPendingEntries();
         return;
       }
 
@@ -334,37 +442,15 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
           if (!cmd.empty()) sh.note(cmd);
           return true;
         }
-        // Face images are fetched by the avatar thread; this only records the wish.
-        sh.noteAvatar(m.avatarUrl);
-        if (!m.avatarUrl.empty()) {
-          // A URL we already have means two users share one picture. When that picture is the
-          // site's default, several different people appear with the same flat disc, which reads
-          // as a rendering fault and is not one.
-          if (verbose && avatars.isCached(m.avatarUrl))
-            std::fprintf(stderr, "[avatar] shared pic: %s  (user %s)\n", m.avatarUrl.c_str(),
-                         m.user.c_str());
-          avatars.request(m.avatarUrl);
-        // Emotes are fetched from the platform's own CDN URLs in extra.emots. They go in a separate
-        // store because they are reused all evening by everyone, unlike faces which are one per
-        // viewer, so they deserve their own cache budget and a bigger share of it.
-        for (const Fragment& part : m.parts) {
-          if (part.kind == Fragment::Kind::Emote && !part.url.empty())
-            emoteImages.request(part.url);
+        if (m.kind == MsgKind::Entry) {
+          // Folded rather than shown: this notice may only end up inside a summary row that comes
+          // later, or in one that has already been drawn, in which case it is counted into nothing
+          // that is on screen yet.
+          Message row;
+          if (!entries.push(m, steadyMs(), row)) return true;
+          return publish(std::move(row));
         }
-        }
-        if (verbose)
-          std::fprintf(stderr, "[msg] %s%s: %s\n",
-                       m.kind == MsgKind::Text ? "" : (m.kind == MsgKind::Paid ? "[paid] " : "[sub] "),
-                       m.user.c_str(), m.plainText().c_str());
-        sh.append(std::move(m));
-        const int n = received.fetch_add(1) + 1;
-        if (count > 0 && n >= count) {
-          if (verbose) std::fprintf(stderr, "[site] reached --count %d\n", count);
-          stop.store(true);
-          if (video) video->quit();
-          return false;  // stop the walk
-        }
-        return true;
+        return publish(std::move(m));
       });
     }
   } catch (const std::exception& e) {
@@ -419,13 +505,54 @@ std::vector<Message> demoMessages() {
   after.parts.emplace_back(Fragment{Fragment::Kind::Text, "弹幕姬启动", "", 0});
   out.push_back(after);
 
+  // The three ambient kinds, interleaved with chat rather than listed at the end: the point of the
+  // demo is what the column looks like with them mixed in, and a block of them at the bottom would
+  // not show that. Two entries, because one row per viewer is the case that matters (no count) and
+  // the combined row is the other half of it. Two gifts, one with a count, because the count is the
+  // only part of that row that varies. The gift picture URL is left as it arrives in the demo: the
+  // offline path has no fetcher for it, so the icon falls back to the gift name as text -- which is
+  // the same thing the renderer does when the picture is merely late, and so is worth seeing here.
+  Message gift;
+  gift.kind = MsgKind::Gift;
+  gift.user = "氧***";
+  gift.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  gift.parts.push_back(Fragment{Fragment::Kind::Emote, "人气票", "", 0});
+  out.push_back(gift);
+
+  Message entry;
+  entry.kind = MsgKind::Entry;
+  entry.user = "十四的茶";
+  entry.parts.push_back(Fragment{Fragment::Kind::Text, "进入了直播间", "", 0});
+  out.push_back(entry);
+
+  Message like;
+  like.kind = MsgKind::Like;
+  like.user = "strangeLex";
+  like.parts.push_back(Fragment{Fragment::Kind::Text, "为主播点赞了", "", 0});
+  out.push_back(like);
+
+  Message giftMany;
+  giftMany.kind = MsgKind::Gift;
+  giftMany.user = "串***";
+  giftMany.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  giftMany.parts.push_back(Fragment{Fragment::Kind::Emote, "小番茄", "", 0});
+  giftMany.parts.push_back(Fragment{Fragment::Kind::Text, " ×6", "", 0});
+  out.push_back(std::move(giftMany));
+
+  Message entryMany;
+  entryMany.kind = MsgKind::Entry;
+  entryMany.user = "懿曙";
+  entryMany.parts.push_back(Fragment{Fragment::Kind::Text, "等 7 人进入了直播间", "", 0});
+  out.push_back(entryMany);
+
   // Every chat row asks for a synthetic face. Without this the demo draws no avatar at all, and a
   // missing avatar is indistinguishable from one drawn into the wrong box -- which is the whole
   // thing the red-and-green grids exist to reveal. The cards keep an empty URL, matching a live
-  // paid message, which has no face.
+  // paid message, which has no face. The entry notices keep an empty one as well: that is what a
+  // live entry notice carries, and the row is laid out from that, not from a hypothetical face.
   int face = 0;
   for (Message& m : out) {
-    if (m.kind != MsgKind::Text) continue;
+    if (m.kind == MsgKind::Entry || isCard(m.kind)) continue;
     m.avatarUrl = demoFaceKey(face++);
   }
   return out;
@@ -672,8 +799,8 @@ int main(int argc, char** argv) {
       std::thread site;
       if (!o.demo) {
         site = std::thread(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars),
-                           std::ref(emoteImages), o.room, o.verbose, std::ref(stop), &video,
-                           std::ref(received), o.count);
+                           std::ref(emoteImages), o.room, o.entryMergeMs, o.verbose, std::ref(stop),
+                           &video, std::ref(received), o.count);
       }
 
       std::thread killer;
@@ -739,8 +866,9 @@ int main(int argc, char** argv) {
   std::thread avatarThread([&avatars] { avatars.runWorker(); });
   std::thread emoteThread([&emoteImages] { emoteImages.runWorker(); });
   std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), std::ref(emoteImages),
-                   o.room, o.verbose, std::ref(stop), static_cast<pwvideo::VideoNode*>(nullptr),
-                   std::ref(received), o.count > 0 ? o.count : kDumpMessages);
+                   o.room, o.entryMergeMs, o.verbose, std::ref(stop),
+                   static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received),
+                   o.count > 0 ? o.count : kDumpMessages);
   const int64_t until = steadyMs() + 90000;
   // Wait for a few messages rather than just the first: one row is not enough to judge a layout,
   // and a panel with real avatars in it needs more than one row to show them.
