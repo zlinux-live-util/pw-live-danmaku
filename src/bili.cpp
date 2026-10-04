@@ -736,8 +736,18 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     out.parts.push_back(std::move(icon));
 
     const uint64_t count = gift.num(3);
-    if (count > 1)
-      out.parts.push_back(Fragment{Fragment::Kind::Text, " ×" + std::to_string(count), "", 0});
+    // Written through Message::withCount(), which is the same call GiftMerger rebuilds a row with,
+    // so the text on the row and the number the merger adds up cannot come to disagree.
+    out = out.withCount(count > 0 ? static_cast<int64_t>(count) : 1);
+
+    // What makes two of these the same gift to a viewer: the same gift, from the same person, again.
+    // GiftMerger keys on this, together with the sender, so that a viewer tapping one button ten
+    // times gets one row counting ten. The id is the gift's own identity and the name is what the
+    // row actually says, so both go in: any disagreement between them -- the site renaming a gift,
+    // a payload that arrives without an id at all -- leaves the rows apart instead of folding two
+    // different things together. That is the direction to fail in, two rows where one would do,
+    // rather than a row claiming one viewer sent a gift they did not.
+    out.mergeKey = "gift/" + std::to_string(gift.num(1)) + "/" + giftName;
     return true;
   }
 

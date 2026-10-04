@@ -88,11 +88,39 @@ struct Message {
    *  that bills in a different unit sets it to what its own table is denominated in. */
   int64_t amountValue = 0;
 
+  /** How many of one thing this row stands for: 6 for a gift of six, 1 for a single one. Zero means
+   *  "not a counted row", and is counted as one wherever a count is taken.
+   *
+   *  Carried beside the rendered " ×6" for the same reason `amountValue` sits beside `amount`:
+   *  combining rows needs the number, and recovering it from the display string would mean parsing
+   *  a formatted string back into one. GiftMerger adds these up and rewrites the text from it. */
+  int64_t count = 0;
+
+  /** Identity of the *thing* this row is about, for a site where two rows can mean the same thing
+   *  at once. Empty on an ordinary row, which then always gets a row of its own.
+   *
+   *  GiftMerger keys on this together with the viewer, so one person tapping the same gift button
+   *  ten times gets one row counting ten rather than ten rows saying the same thing. A site that
+   *  leaves it empty gets no combining -- rather than everything combined into one. */
+  std::string mergeKey;
+
   int64_t tsMs = 0;
 
   /** The body as plain text, concatenating the text runs and keeping emote tokens as typed. Used
    *  for layout fallback and for diagnostics. */
   std::string plainText() const;
+
+  /** This row carrying `total` of the thing it is about, for a counted row: the count fragment it
+   *  already has is replaced rather than appended to, and a row of one carries none at all, which
+   *  is what makes calling this twice on the same row give the same row. Counts are added to rather
+   *  than replaced -- a gift of six plus one more is a row of seven.
+   *
+   *  The count fragment is found by the text this very function writes, so reading a count off the
+   *  wire and rebuilding one after a merge cannot end up disagreeing about what a count looks like;
+   *  that is the same reason `count` sits beside the rendered text rather than replacing it. Only
+   *  call it on a counted row: on an ordinary chat row whose text happens to begin with the count
+   *  marker, it would read that text as a count and drop it. */
+  Message withCount(int64_t total) const;
 };
 
 /** A bounded, oldest-first message history. The bound is what keeps memory flat in a busy room:

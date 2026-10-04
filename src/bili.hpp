@@ -11,10 +11,13 @@
 //    clients send is answered by an immediate disconnect -- four schema variants were tried.
 //
 // Nothing here blocks the render thread: it is all called from the site thread.
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "json.hpp"
 #include "message.hpp"
@@ -243,6 +246,158 @@ class EntryMerger {
   int pending_ = 0;
   /** The notice the next row is named after: the first of the batch. */
   Message head_;
+};
+
+/** Folds repeated gifts from the same viewer into one row per window.
+ *
+ *  The same problem EntryMerger solves, one level down. Entry notices are frequent and every one is
+ *  a different viewer, so they are folded by the room. A gift is something *one* viewer may repeat:
+ *  bilibili's gift buttons are taps, and a viewer who likes a gift and taps it ten times produces
+ *  ten rows saying the same thing, each pushing a line of actual chat off the top. The count is
+ *  already on screen in that case -- a single gift of six reads " ×6" -- so a merged row is the
+ *  same row with the sum and the picture of the first of them.
+ *
+ *  Keyed by viewer *and* gift, not by viewer alone: two different gifts are two different things and
+ *  each earns its own row. The viewer's face is part of the key because an anonymous connection
+ *  masks every nickname into the same few shapes (`氧***`), and merging two people who happen to
+ *  share a masked name would show one of them having sent a gift the other one sent.
+ *
+ *  The row is held for the window and not drawn-then-amended, because the panel draws a row once
+ *  and afterwards only moves its pixels: there is nothing to amend. The price is that a lone gift
+ *  appears up to windowMs late, which is the same trade EntryMerger makes and the reason a window
+ *  of 0 is a real option rather than a degenerate one.
+ *
+ *  Several runs are held at once, so a flush can publish more than one row: two viewers sending
+ *  different gifts in the same window are not each other's duplicate. flush() therefore appends to a
+ *  vector, and the caller publishes whatever came out of it in order. */
+class GiftMerger {
+ public:
+  /** The window used when --gift-merge is not given. Shorter than EntryMerger's on purpose: a
+   *  folded entry notice costs nothing but a dimmed row, whereas this one delays a thank-you to the
+   *  person who paid for it. It is still long enough to hold a burst of taps. The single source of
+   *  that number -- the command line reads its own default from here. */
+  static constexpr int64_t kDefaultWindowMs = 3000;
+
+  explicit GiftMerger(int64_t windowMs = kDefaultWindowMs) : windowMs_(windowMs) {}
+
+  int64_t windowMs() const { return windowMs_; }
+
+  /** Feeds one gift in.
+   *
+   *  With a window the row it belongs to is held until the window ends, and nothing is appended to
+   *  out; with no window, or for a row the site gave no merge key to, the message goes straight into
+   *  out and is this viewer's row to draw. Appending rather than returning one message is what lets
+   *  the unmerged path share this call with the merged one. */
+  void push(const Message& gift, int64_t nowMs, std::vector<Message>& out) {
+    // Two ways to have nothing to combine with: no window was asked for, or the site gave this row
+    // no key. Both mean the row is its own, and it goes straight out rather than being held for a
+    // window that could never have matched anything.
+    if (windowMs_ <= 0 || gift.mergeKey.empty()) {
+      out.push_back(gift);
+      return;
+    }
+
+    Run& run = runs_[keyOf(gift)];
+    const int64_t count = gift.count > 0 ? gift.count : 1;
+    // total is the sentinel for "this run is open": a gift is always worth at least one, so zero can
+    // only mean nothing has been counted yet. It is a field rather than a test for the key's
+    // presence, so a run that is created and immediately closed leaves nothing behind.
+    if (run.total == 0) {
+      run.row = gift;
+      // The window runs from the first gift of the run and is not extended by the ones after it.
+      // Extending it would let a viewer who keeps tapping hold one row off the panel forever, which
+      // is the flood this replaces -- only slower.
+      run.dueAtMs = nowMs + windowMs_;
+    }
+    run.total += count;
+    pending_ += count;
+  }
+
+  /** Appends every row whose window has elapsed, oldest run first.
+   *
+   *  Called on every wake-up of the read loop, so a run is never more than one read deadline late --
+   *  the same reason EntryMerger needs its flush(): waiting for the next gift would leave the last
+   *  few of a burst uncounted until somebody else sent one, which in a quiet room could be never. */
+  bool flush(int64_t nowMs, std::vector<Message>& out, bool ignoreWindow = false) {
+    if (runs_.empty()) return false;
+
+    // Oldest run first. The map is keyed by viewer and gift, so it knows nothing about arrival
+    // order, and the row that has been waiting longest is the one that should appear first when
+    // several runs come due in the same wake-up.
+    std::vector<RunIter> due;
+    for (RunIter it = runs_.begin(); it != runs_.end(); ++it) {
+      if (!ignoreWindow && nowMs < it->second.dueAtMs) continue;
+      due.push_back(it);
+    }
+    std::stable_sort(due.begin(), due.end(), [](const RunIter& a, const RunIter& b) {
+      return a->second.dueAtMs < b->second.dueAtMs;
+    });
+
+    for (const RunIter& it : due) {
+      // The row carries the first gift's verb and picture; only the count is rewritten, which is
+      // what keeps a merged row looking like one gift rather than a summary sentence.
+      out.push_back(it->second.row.withCount(it->second.total));
+      pending_ -= it->second.total;
+      // Erased by iterator, not by keyOf(run->row). Erasing by key would be a second, separate
+      // derivation of the same identity, and it would only hold as long as withCount() happened to
+      // leave user, avatarUrl and mergeKey alone -- a silent coupling, because a key that stopped
+      // matching would neither fail to compile nor throw: the run would just stay in the map,
+      // pending_ would already have been credited back, and the same row would be published again
+      // on the next flush. map::erase invalidates only the iterator it is given, so the runs still
+      // to be visited stay valid while this loop empties the map underneath them.
+      runs_.erase(it);
+    }
+    return !due.empty();
+  }
+
+  /** Appends everything held right now, window or no window.
+   *
+   *  For the end of the stream, where waiting is no longer an option: once the socket is gone no
+   *  further gift will arrive to close the run, and these were really sent -- folding them away at
+   *  that point would make the panel's account of who gave what disagree with what the stream
+   *  carried.
+   *
+   *  A wrapper rather than a second walk: one pass over the runs, told to ignore their windows. */
+  bool flushAll(std::vector<Message>& out) { return flush(0, out, true); }
+
+  /** Gifts held back right now, over every run. Diagnostics and tests only. */
+  int64_t pending() const { return pending_; }
+  /** How many runs are open, which is how many rows a flush can produce. Diagnostics and tests. */
+  size_t pendingRows() const { return runs_.size(); }
+
+ private:
+  /** One viewer sending one gift, inside one window. */
+  struct Run {
+    /** The first gift of the run: verb, icon, face and name -- everything the row shows that is not
+     *  the count. Later gifts of the same run contribute their count and nothing else. */
+    Message row;
+    /** Gifts in the run, summed from Message::count rather than counted as events: a row for "×6"
+     *  plus one more is "×7", not "×2". */
+    int64_t total = 0;
+    /** When this run's window ends, measured from its first gift so a burst cannot keep pushing the
+     *  row out indefinitely. */
+    int64_t dueAtMs = 0;
+  };
+
+  /** The open runs. A map rather than a list because a room with several people sending gifts at
+   *  once opens several runs, and each has to be found by key on arrival. */
+  using RunMap = std::map<std::string, Run>;
+  /** One open run where it sits in that map: how a run is handed out and, in flush(), closed. */
+  using RunIter = RunMap::iterator;
+
+  /** What makes two gifts the same row: the viewer's name and face, and the gift's own key.
+   *
+   *  A NUL between the parts, because none of them can contain one and a separator that can appear
+   *  inside its own fields is a key that can collide. */
+  static std::string keyOf(const Message& gift) {
+    return gift.user + std::string(1, '\0') + gift.avatarUrl + std::string(1, '\0') + gift.mergeKey;
+  }
+
+  int64_t windowMs_;
+  /** Open runs, keyed by viewer and gift. */
+  RunMap runs_;
+  /** Gifts held across every open run, which is what pending() reports. */
+  int64_t pending_ = 0;
 };
 
 }  // namespace dwm

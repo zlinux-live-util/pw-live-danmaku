@@ -108,6 +108,12 @@ void usage(std::FILE* out) {
       "                     with a million watchers they arrive at 1.6/s against 0.36/s of chat,\n"
       "                     so a row each pushes most of what was typed off the top. Default 5000;\n"
       "                     0 gives every notice its own row as it arrives\n"
+      "  --gift-merge MS    Combine repeated gifts from one viewer into one row per this many\n"
+      "                     milliseconds, counted. Keyed on the viewer *and* the gift, so a viewer\n"
+      "                     tapping one gift button ten times gets one row counting ten instead of\n"
+      "                     ten rows saying the same thing. The row waits out the window, so a lone\n"
+      "                     gift appears this long late. Default 3000; 0 gives every gift its own\n"
+      "                     row as it arrives\n"
       "  --node NAME        PipeWire node name, default pw-live-danmaku\n"
       "  --desc TEXT        Node description (this is what the OBS dropdown shows), default\n"
       "                     \"Live Chat\"\n"
@@ -117,7 +123,8 @@ void usage(std::FILE* out) {
       "  --dump FILE        Render one sample frame to PNG and exit\n"
       "  --count N          Exit after drawing N rows (0 = never). Counts the rows that reach the\n"
       "                     panel, so entry notices folded into a combined row by --entry-merge\n"
-      "                     do not count towards it\n"
+      "                     and gifts folded into a counted row by --gift-merge do not count\n"
+      "                     towards it\n"
       "  --seconds N        Exit after N seconds (0 = never)\n"
       "  --demo             Draw a fixed set of messages and no network at all, for tuning the\n"
       "                     layout without a live room. Overrides --room.\n"
@@ -140,6 +147,9 @@ struct Options {
   // the two. Not clamped to a minimum: 0 is a real value meaning "no combining", so a lower bound
   // would make it unreachable exactly when someone asks for it.
   int entryMergeMs = static_cast<int>(EntryMerger::kDefaultWindowMs);
+  // Same arrangement for the gift window: the default is the merger's own, so the number cannot
+  // drift between the two.
+  int giftMergeMs = static_cast<int>(GiftMerger::kDefaultWindowMs);
   // 0 means "not given", so an unset flag leaves PanelTokens' own default in place rather than
   // restating it here: the two would otherwise drift apart the first time one of them is edited.
   double fontSize = 0.0, cardFontSize = 0.0;
@@ -174,6 +184,8 @@ Args parseArgs(int argc, char** argv, Options& o) {
       o.fontFiles.push_back(next(i));
     } else if (a == "--entry-merge") {
       o.entryMergeMs = std::max(0, std::stoi(next(i)));
+    } else if (a == "--gift-merge") {
+      o.giftMergeMs = std::max(0, std::stoi(next(i)));
     } else if (a == "--node") {
       o.node = next(i);
     } else if (a == "--desc") {
@@ -278,7 +290,7 @@ const char* kindTag(MsgKind k) {
 }
 
 void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImages,
-              const std::string& roomInput, int entryMergeMs, bool verbose,
+              const std::string& roomInput, int entryMergeMs, int giftMergeMs, bool verbose,
               std::atomic<bool>& stop, pwvideo::VideoNode* video, std::atomic<int>& received,
               int count) {
   try {
@@ -350,16 +362,25 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
     if (verbose) std::fprintf(stderr, "[site] authenticated\n");
     sh.setState("streaming");
 
-    // Entry notices are folded into one row per window on the way out, so the policy lives with the
-    // only loop that has a clock. The other two event kinds need nothing like it: gifts and likes
-    // arrive an order of magnitude more slowly than chat and are passed through as they come.
+    // Entry notices and gifts are both folded on the way out, so both policies live with the only
+    // loop that has a clock -- a row from either of them is published when a window ends, not when
+    // the message that would have filled it arrives. Likes need nothing like it: they are one per
+    // viewer per click, an order of magnitude slower than chat, and there is nobody to fold them
+    // with.
     EntryMerger entries(entryMergeMs);
-    if (verbose)
+    GiftMerger gifts(giftMergeMs);
+    if (verbose) {
       std::fprintf(stderr, "[site] entry notices: %s\n",
                    (entryMergeMs > 0
                         ? "combined into one row per " + std::to_string(entryMergeMs) + " ms"
                         : std::string("one row each"))
                        .c_str());
+      std::fprintf(stderr, "[site] gifts: %s\n",
+                   (giftMergeMs > 0
+                        ? "one row per viewer and gift per " + std::to_string(giftMergeMs) + " ms"
+                        : std::string("one row each"))
+                       .c_str());
+    }
 
     /** Hands one finished message to the render side. False once --count has been reached, which
      *  is the forEachJson visitor's signal to stop walking this websocket message. */
@@ -399,20 +420,29 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
       return true;
     };
 
-    /** Publishes whatever entry notices are still batched, without waiting out the window.
+    /** Publishes whatever is still batched, without waiting out the window.
      *
      *  For the paths where no further notice is ever coming -- the socket is gone, so nothing will
-     *  ever close the batch. Those people did walk in, and the rest of the panel is still on screen
-     *  showing whatever it rendered before the drop, so the row belongs in it: folding it away at
-     *  that point would make the row count disagree with the number of viewers the panel actually
-     *  saw, which is the one thing the row exists to be accurate about.
+     *  ever close the batch. Those people did walk in, and the gifts were really sent, and the rest
+     *  of the panel is still on screen showing whatever it rendered before the drop, so the rows
+     *  belong in it: folding them away at that point would make the row count disagree with what
+     *  the stream actually carried, which is the one thing the rows exist to be accurate about.
      *
      *  Deliberately silent when stopping: on SIGINT, --seconds or --count there is no point drawing
      *  one more row, and the notice that tripped --count has already been refused by the window. */
-    auto publishPendingEntries = [&] {
+    auto publishPendingBatches = [&] {
       if (stop.load()) return;
       Message due;
       if (entries.flushAll(due)) publish(std::move(due));
+      // A vector rather than one Message: unlike the entry notices, which fold into a single row,
+      // several gift runs can come due at once -- two viewers sending different gifts are not each
+      // other's duplicate. publish() can refuse the last of them at --count, and the rest of the
+      // walk is then abandoned with it.
+      std::vector<Message> rows;
+      if (gifts.flushAll(rows)) {
+        for (Message& row : rows)
+          if (!publish(std::move(row))) return;
+      }
     };
 
     // The read deadline is what drives the heartbeat timer: one thread, no second timer.
@@ -427,24 +457,30 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
           // an Error arriving: the same batch has to go out before leaving, or the reason depends
           // on which of the three notices the socket happened to drop on.
           sh.setState("heartbeat failed: " + ws.lastError());
-          publishPendingEntries();
+          publishPendingBatches();
           return;
         }
       }
       if (ev == WsClient::Event::Timeout) {
-        // A read deadline is the only clock this loop has, so it is also where a finished batch of
-        // entry notices gets published. Waiting for the next notice instead would leave the last
-        // few of a burst uncounted until somebody else walked in, which in a quiet room could be
+        // A read deadline is the only clock this loop has, so it is also where a finished batch gets
+        // published. Waiting for the next message instead would leave the last few of a burst
+        // uncounted until somebody else walked in or sent a gift, which in a quiet room could be
         // never -- the row would show up late or not at all, from a mechanism whose whole point is
-        // that it does not have to wait.
+        // that it does not have to wait. A row is therefore at most one read deadline (1 s) past
+        // its window, which is why neither window has to be longer than that to look immediate.
         Message due;
         if (!stop.load() && entries.flush(now, due)) publish(std::move(due));
+        std::vector<Message> rows;
+        if (!stop.load() && gifts.flush(now, rows)) {
+          for (Message& row : rows)
+            if (!publish(std::move(row))) return;
+        }
         continue;
       }
       if (ev == WsClient::Event::Error || ev == WsClient::Event::Close) {
         sh.setState(std::string(ev == WsClient::Event::Close ? "closed by peer" : "error") + ": " +
                     ws.lastError());
-        publishPendingEntries();
+        publishPendingBatches();
         return;
       }
 
@@ -465,6 +501,17 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
           Message row;
           if (!entries.push(m, steadyMs(), row)) return true;
           return publish(std::move(row));
+        }
+        if (m.kind == MsgKind::Gift) {
+          // Folded the same way, on a different key: this viewer sending this gift again inside the
+          // window is one row counted twice, not two rows. Nothing is emitted here while a window is
+          // open -- push() hands the row straight back only when there is no window or no key, which
+          // is why this can hand over whatever it collected instead of a single row.
+          std::vector<Message> rows;
+          gifts.push(m, steadyMs(), rows);
+          for (Message& row : rows)
+            if (!publish(std::move(row))) return false;
+          return true;
         }
         return publish(std::move(m));
       });
@@ -819,8 +866,8 @@ int main(int argc, char** argv) {
       std::thread site;
       if (!o.demo) {
         site = std::thread(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars),
-                           std::ref(emoteImages), o.room, o.entryMergeMs, o.verbose, std::ref(stop),
-                           &video, std::ref(received), o.count);
+                           std::ref(emoteImages), o.room, o.entryMergeMs, o.giftMergeMs, o.verbose,
+                           std::ref(stop), &video, std::ref(received), o.count);
       }
 
       std::thread killer;
@@ -886,7 +933,7 @@ int main(int argc, char** argv) {
   std::thread avatarThread([&avatars] { avatars.runWorker(); });
   std::thread emoteThread([&emoteImages] { emoteImages.runWorker(); });
   std::thread site(siteLoop, std::ref(sh), std::ref(bili), std::ref(avatars), std::ref(emoteImages),
-                   o.room, o.entryMergeMs, o.verbose, std::ref(stop),
+                   o.room, o.entryMergeMs, o.giftMergeMs, o.verbose, std::ref(stop),
                    static_cast<pwvideo::VideoNode*>(nullptr), std::ref(received),
                    o.count > 0 ? o.count : kDumpMessages);
   const int64_t until = steadyMs() + 90000;

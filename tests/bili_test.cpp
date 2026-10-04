@@ -568,6 +568,10 @@ void testParseGift() {
           "gift: gift_info field 1, the PNG; field 2 is a webp and this decoder is not promised "
           "to read those");
   checkEqInt(m.tsMs, 1791089900000LL, "gift: field 10 of the gift is seconds, converted to ms");
+  checkEqInt(m.count, 1LL, "gift: field 3 was 1, carried as a number so a merge can add it up");
+  // The whole key, not just that there is one: gift id 33988 and the name, because a gift merged
+  // under the wrong key is a row that says one of two people sent a gift the other one sent.
+  checkEq(m.mergeKey, "gift/33988/人气票", "gift: the key GiftMerger groups on, id and name");
   check(!isCard(m.kind), "gift: not a card");
 }
 
@@ -589,7 +593,159 @@ void testParseGiftCount() {
         "gift count: recognised");
   checkEq(m.plainText(), "投喂 人气票 ×6", "gift count: the count is appended, and only above one");
   checkEqInt(m.parts.size(), size_t(3), "gift count: verb, picture, count");
+  checkEqInt(m.count, 6LL, "gift count: the same number, separately, for the merger to add up");
   checkEq(m.user, "氧***", "gift count: nothing else about the row moved");
+}
+
+/** A gift row as the site layer builds it: verb, icon, and a count when there is more than one.
+ *  Written by hand rather than decoded from the blob, because these tests are about what happens to
+ *  rows over time rather than about what one wire payload means -- that is testParseGift above. */
+Message makeGift(const char* who, const char* giftKey, int64_t count, const char* face = "") {
+  Message g;
+  g.kind = MsgKind::Gift;
+  g.user = who;
+  g.avatarUrl = face;
+  g.mergeKey = giftKey;
+  g.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0});
+  // The icon carries the gift's name, taken as the last component of the key, so a fixture written
+  // gift/2/小番茄 produces a row that reads like 小番茄 and not like every other fixture.
+  const std::string key(giftKey);
+  const size_t slash = key.rfind('/');
+  g.parts.push_back(
+      Fragment{Fragment::Kind::Emote, slash == std::string::npos ? key : key.substr(slash + 1),
+               "", 0});
+  if (count > 1)
+    g.parts.push_back(Fragment{Fragment::Kind::Text, " ×" + std::to_string(count), "", 0});
+  g.count = count;
+  return g;
+}
+
+void testGiftMergerFoldsOneViewerTappingTheSameGift() {
+  // The case this exists for: one viewer taps one gift button ten times and gets ten rows, each of
+  // which pushes a line of chat off the top. One row counting ten is the whole feature.
+  GiftMerger m(3000);
+  std::vector<Message> rows;
+  m.push(makeGift("A", "gift/1/人气票", 1), 0, rows);
+  checkEqInt(rows.size(), size_t(0), "gift merger: nothing is drawn while the window is open");
+  for (int i = 0; i < 9; ++i) m.push(makeGift("A", "gift/1/人气票", 1), 100 + i, rows);
+  checkEqInt(rows.size(), size_t(0), "gift merger: nor by the tenth tap");
+  checkEqInt(m.pending(), 10LL, "gift merger: all ten are held");
+  checkEqInt(m.pendingRows(), size_t(1), "gift merger: as one run");
+
+  check(!m.flush(2999, rows), "gift merger: not due just before the window ends");
+  check(m.flush(3000, rows), "gift merger: due once it has");
+  checkEqInt(rows.size(), size_t(1), "gift merger: ten gifts are one row");
+  checkEq(rows[0].user, "A", "gift merger: named after the viewer, as the first one was");
+  checkEq(rows[0].plainText(), "投喂 人气票 ×10", "gift merger: counting them");
+  checkEqInt(rows[0].count, 10LL, "gift merger: and the number agrees with the text");
+  checkEqInt(m.pending(), 0LL, "gift merger: nothing left over");
+
+  // A tap after the row went out is a new run, not an amendment to a row already on screen.
+  m.push(makeGift("A", "gift/1/人气票", 1), 4000, rows);
+  checkEqInt(m.pendingRows(), size_t(1), "gift merger: the next tap opens a new run");
+  check(m.flush(7000, rows), "gift merger: which comes due on its own window");
+  checkEqInt(rows.size(), size_t(2), "gift merger: and is a row of its own");
+  checkEq(rows[1].plainText(), "投喂 人气票", "gift merger: a single gift shows no count at all");
+}
+
+void testGiftMergerAddsUpCountsNotEvents() {
+  // A row for six of one gift plus one more is seven, not two. The number is summed because that is
+  // what the row says; counting the events instead would under-report exactly the runs that matter.
+  GiftMerger m(3000);
+  std::vector<Message> rows;
+  m.push(makeGift("A", "gift/1/人气票", 6), 0, rows);
+  m.push(makeGift("A", "gift/1/人气票", 1), 100, rows);
+  check(m.flush(3000, rows), "gift merger: due");
+  checkEq(rows[0].plainText(), "投喂 人气票 ×7", "gift merger: 6 plus one is seven");
+  checkEqInt(rows[0].count, 7LL, "gift merger: the number is the sum too");
+  // Two sixes in a row: the rewritten text must replace the old one rather than sit after it, or
+  // the row would read " ×6 ×12".
+  m.push(makeGift("A", "gift/1/人气票", 6), 4000, rows);
+  m.push(makeGift("A", "gift/1/人气票", 6), 4100, rows);
+  check(m.flush(7000, rows), "gift merger: the next run is due");
+  checkEq(rows[1].plainText(), "投喂 人气票 ×12", "gift merger: exactly one count on the row");
+  checkEqInt(rows[1].parts.size(), size_t(3), "gift merger: verb, picture, one count");
+}
+
+void testGiftMergerKeysOnViewerAndGift() {
+  // The three ways two gifts are *not* each other's duplicate. Each of these must stay a row, or the
+  // feature starts losing gifts that really happened.
+  GiftMerger m(3000);
+  std::vector<Message> rows;
+  m.push(makeGift("A", "gift/1/人气票", 1), 0, rows);      // the run
+  m.push(makeGift("B", "gift/1/人气票", 1), 10, rows);     // another viewer, same gift
+  m.push(makeGift("A", "gift/2/小番茄", 1), 20, rows);     // same viewer, another gift
+  // Same masked nickname again, with another face: the part of the key that tells two people who
+  // happen to share one apart.
+  m.push(makeGift("A", "gift/1/人气票", 1, "https://face/b.jpg"), 30, rows);
+  checkEqInt(m.pendingRows(), size_t(4), "gift merger: four runs, not one");
+  checkEqInt(m.pending(), 4LL, "gift merger: four gifts held");
+
+  check(m.flush(3000, rows), "gift merger: the first run is due on its own window");
+  checkEqInt(rows.size(), size_t(1), "gift merger: the runs that opened later are not due yet -- "
+                                    "each window starts at its own first gift, not at the first "
+                                    "gift of the room");
+  check(m.flush(3030, rows), "gift merger: the rest are due once their own windows pass");
+  checkEqInt(rows.size(), size_t(4), "gift merger: all four rows come out -- a flush can publish "
+                                    "more than one row");
+  // Oldest run first, so the row that waited longest appears first. The map is keyed by viewer and
+  // gift and knows nothing about arrival order, which is what makes this order worth pinning.
+  checkEq(rows[0].user, "A", "gift merger: the run that opened first is published first");
+  checkEq(rows[0].plainText(), "投喂 人气票", "gift merger: with no count of its own");
+  checkEq(rows[1].user, "B", "gift merger: the other viewer's row is separate");
+  checkEq(rows[2].parts[1].text, "小番茄", "gift merger: so is the same viewer sending another gift");
+  checkEq(rows[3].avatarUrl, "https://face/b.jpg",
+          "gift merger: and a masked nickname sharing a name is still two people");
+  checkEqInt(m.pending(), 0LL, "gift merger: every run was closed");
+  checkEqInt(m.pendingRows(), size_t(0), "gift merger: and none left behind");
+}
+
+void testGiftMergerWithoutAKeyOrWindow() {
+  // Two rows that must never be folded into one: a site that gave no key to compare on, and the
+  // window turned off. Both would otherwise lose a gift that was really sent.
+  GiftMerger keyed(3000);
+  std::vector<Message> rows;
+  Message anonymous = makeGift("A", "人气票", 1);
+  anonymous.mergeKey.clear();
+  keyed.push(anonymous, 0, rows);
+  checkEqInt(rows.size(), size_t(1), "no key: a row with no key is drawn at once, never held");
+  checkEqInt(keyed.pending(), 0LL, "no key: and there is nothing to flush");
+
+  GiftMerger unmerged(0);
+  rows.clear();
+  unmerged.push(makeGift("A", "gift/1/人气票", 1), 0, rows);
+  unmerged.push(makeGift("A", "gift/1/人气票", 1), 0, rows);
+  checkEqInt(rows.size(), size_t(2), "no window: a same-instant burst still gets one row each");
+  checkEq(rows[0].plainText(), "投喂 人气票", "no window: first, unmerged");
+  checkEq(rows[1].plainText(), "投喂 人气票", "no window: and second, unmerged");
+  check(!unmerged.flush(999999, rows), "no window: nothing was held, so nothing comes out later");
+  checkEqInt(rows.size(), size_t(2), "no window: and the burst is not replayed at the end");
+
+  // The default has to be one number, not one per call site: the command line reads its own default
+  // from here, so the two cannot drift apart when either is edited.
+  checkEqInt(GiftMerger::kDefaultWindowMs, 3000, "gift merger: the published default window");
+  checkEqInt(GiftMerger().windowMs(), GiftMerger::kDefaultWindowMs,
+             "gift merger: and a default-constructed merger uses it");
+}
+
+void testGiftMergerFlushAllOnDisconnect() {
+  // The socket died with a run in hand. flush() would refuse it, because its window has not elapsed
+  // and no further gift is ever coming to close it -- so a gift that was really sent would be folded
+  // away and the panel's account of who gave what would disagree with the stream.
+  GiftMerger m(3000);
+  std::vector<Message> rows;
+  m.push(makeGift("A", "gift/1/人气票", 1), 0, rows);
+  m.push(makeGift("A", "gift/1/人气票", 2), 100, rows);
+  m.push(makeGift("B", "gift/2/小番茄", 1), 200, rows);
+  checkEqInt(m.pending(), 4LL, "flushAll: three runs' worth of gifts are held back");
+  check(!m.flush(300, rows), "flushAll: the windowed flush still refuses an unfinished run");
+  check(m.flushAll(rows), "flushAll: but they go out anyway at the end of the stream");
+  checkEqInt(rows.size(), size_t(2), "flushAll: one row per run, not per gift");
+  checkEq(rows[0].plainText(), "投喂 人气票 ×3", "flushAll: counted in full");
+  checkEq(rows[1].plainText(), "投喂 小番茄", "flushAll: and the other viewer is not lost either");
+  checkEqInt(m.pending(), 0LL, "flushAll: nothing left over");
+  check(!m.flushAll(rows), "flushAll: and nothing to repeat");
+  checkEqInt(rows.size(), size_t(2), "flushAll: the rows are not replayed a second time");
 }
 
 void testParseLike() {
@@ -872,6 +1028,11 @@ int main() {
   testProtobufBlobsDecodeFromEitherAlphabet();
   testParseGift();
   testParseGiftCount();
+  testGiftMergerFoldsOneViewerTappingTheSameGift();
+  testGiftMergerAddsUpCountsNotEvents();
+  testGiftMergerKeysOnViewerAndGift();
+  testGiftMergerWithoutAKeyOrWindow();
+  testGiftMergerFlushAllOnDisconnect();
   testParseLike();
   testEntryMerger();
   testEntryMergerFlushAllOnDisconnect();
