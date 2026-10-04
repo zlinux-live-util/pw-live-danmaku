@@ -792,20 +792,6 @@ int main(int argc, char** argv) {
   PinnedLayer pinned(tokens);
   pinned.resize(o.width, o.height);
 
-  // The previous run's rows, painted before anything else so the rule lands between them and the
-  // first live row rather than under it. --demo is excluded: it is a fixed layout fixture, and a
-  // run that draws nothing but itself must not write or read a history either.
-  size_t restored = 0;
-  if (!o.demo && history.enabled()) {
-    const std::vector<Message> past = history.restore();
-    if (!past.empty()) {
-      panel.rebuildLayer(past, true);
-      restored = past.size();
-      std::fprintf(stderr, "[history] restored %zu row(s) from %s\n", restored,
-                   history.path().c_str());
-    }
-  }
-
   // Decoded at twice the box, so the face stays crisp on a hidpi canvas without storing four times
   // the pixels it needs. The capacity is separate and only bounds memory: a busy room shows roughly
   // 36 rows, and a visible row's avatar has to outlive the messages that push it off.
@@ -816,6 +802,38 @@ int main(int argc, char** argv) {
   ImageStore emoteImages(48, 512, bili.userAgent());
   panel.setImageStore(&avatars);
   panel.setEmoteStore(&emoteImages);
+
+  // The previous run's rows, painted before anything else arrives so the rule lands between them and
+  // the first live row rather than under it. --demo is excluded: it is a fixed layout fixture, and a
+  // run that draws nothing but itself must not write or read a history either.
+  //
+  //  Below the stores rather than above them, because a restored row is a real row and carries real
+  //  asset URLs, and nothing else will ever ask for them: the only request() calls in the program are
+  //  in publish(), which sees live traffic only. Left unrequested, every restored face stayed a
+  //  placeholder disc -- the most visible row type in the panel, all of them grey.
+  //
+  //  Avatars are fixed by this alone, because drawAvatars() re-reads the store on every frame and a
+  //  face that lands after the row was laid out shows up on the next one. Emote and gift pictures are
+  //  baked into the layer by paintRow() and are not repainted, so a restored row whose picture has
+  //  not arrived by this line keeps drawing the token as text until something shifts the list. That
+  //  is the same bargain a live row makes, and requesting here is what lets a warm cache serve the
+  //  common case; making the layer repaint itself is a larger change than this fix.
+  size_t restored = 0;
+  if (!o.demo && history.enabled()) {
+    const std::vector<Message> past = history.restore();
+    if (!past.empty()) {
+      for (const Message& m : past) {
+        if (!m.avatarUrl.empty()) avatars.request(m.avatarUrl);
+        for (const Fragment& f : m.parts) {
+          if (f.kind == Fragment::Kind::Emote && !f.url.empty()) emoteImages.request(f.url);
+        }
+      }
+      panel.rebuildLayer(past, true);
+      restored = past.size();
+      std::fprintf(stderr, "[history] restored %zu row(s) from %s\n", restored,
+                   history.path().c_str());
+    }
+  }
 
   /** The demo's synthetic faces, keyed the way demoMessages() asks for them. Installed only for
    *  --demo: in a live run the store is the source of truth and this table stays empty, so a real

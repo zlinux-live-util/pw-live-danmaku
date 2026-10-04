@@ -490,6 +490,12 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   // pango already wrapped, so where the line breaks is not something this pass gets a vote on --
   // only the fill changes. A verb that wrapped onto the next line is clipped to [from, to) for the
   // same reason, so each half is drawn on the line it belongs to.
+  //
+  //  Every offset here is a codepoint boundary, which is what makes the substr() below safe on UTF-8:
+  // the verb ranges come from buildBody() measuring whole fragments, and from/to come from pango's
+  // line spans, which are also codepoint-aligned. Splitting a line anywhere else -- mid-character,
+  // or at a byte offset taken from something other than these two -- would hand pango a fragment of
+  // an encoding and lay out replacement characters.
   const auto drawRun = [&](size_t from, size_t to, double x, double y) {
     size_t cur = from;
     double dx = x;
@@ -666,14 +672,15 @@ void Panel::rebuildLayer(const std::vector<Message>& msgs, bool divider) {
   double y = static_cast<double>(height_) - total - dh;
   for (size_t i = 0; i < msgs.size(); ++i) {
     paintRow(lc, msgs[i], 0.0, y, static_cast<double>(width_));
-    rows_.push_back(Row{count_++, contentH_, hs[i], isCard(msgs[i].kind), msgs[i].avatarUrl, false});
+    rows_.push_back(Row{count_++, contentH_, hs[i], isCard(msgs[i].kind), msgs[i].avatarUrl});
     contentH_ += hs[i];
     y += hs[i];
   }
   if (dh > 0.0) {
     paintDivider(lc, y, static_cast<double>(width_));
-    // count_ is left alone: --count counts messages, and a rule is not one.
-    rows_.push_back(Row{count_, contentH_, dh, false, std::string(), true});
+    // count_ is left alone: --count counts messages, and a rule is not one. The empty avatarUrl is
+    // what marks it as not-a-row to drawAvatars().
+    rows_.push_back(Row{count_, contentH_, dh, false, std::string()});
     contentH_ += dh;
   }
 }

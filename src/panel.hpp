@@ -131,10 +131,11 @@ struct Row {
   double h = 0.0;     // full height including the gap below
   bool card = false;
   std::string avatarUrl;
-  /** True for the rule between restored history and what arrived after it. It occupies space in the
-   *  column like a row does, so it scrolls and prunes as one, but it is not a message: it is not
-   *  counted, and it carries no avatar. */
-  bool divider = false;
+  // The rule between restored history and what arrived after it is a Row too -- it occupies space,
+  // scrolls and prunes as one -- but it is not marked here. Nothing needs to tell it apart: it
+  // carries no avatar, so drawAvatars() skips it on the empty URL alone, and it is the only row
+  // with an empty one. A flag that nothing reads is worse than no flag, because the next reader
+  // assumes something depends on it.
 };
 
 class Panel {
