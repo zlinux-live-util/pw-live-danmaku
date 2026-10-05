@@ -1,185 +1,214 @@
+<div align="center">
+
 # pw-live-danmaku
 
-**把 B 站直播间的弹幕，做成一个透明叠加层，以 PipeWire 视频节点输出给 OBS。**
+**Renders a Bilibili live chat as a transparent overlay panel, published to OBS as a PipeWire video node.**
 
-单进程 · 无浏览器 · **零子进程** · 没有消费者连接时不渲染
+[English](README.md) · [简体中文](README.zh-CN.md)
+
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational?style=flat-square" alt="MIT License"></a>
+<img src="https://img.shields.io/badge/platform-Linux-informational?style=flat-square" alt="Linux">
+
+</div>
+
+<br>
+
+<div align="center">
+<img src="docs/panel-480x1080.png" width="300" alt="480x1080 panel: paid messages, a guard card, gift rows, entry notices, a literal &lt;script&gt; line">
+</div>
+
+That is `--demo --dump` output at the default `480x1080`, and it covers every message kind the panel supports in one frame: pinned paid messages and a guard card, gift rows merged with a count, entry notices merged into one line, avatars, emotes, and a `<script>` rendered as literal glyphs. The background is **genuinely transparent**: there is no plate behind the panel when you overlay it on a stream.
 
 ---
 
-## 这是什么
+> One process · No browser · **Zero child processes** · Nothing rendered while no consumer is attached · 94 MB private memory
 
-一个独立的 PipeWire 视频节点，内容是一块**直播聊天面板**：头像、彩色昵称、正文、内联表情、
-付费留言与上舰卡片，背景透明，可以直接叠在直播画面上。
+## Features
 
-它替代的是「用浏览器源 + 一大段 CSS 定制 YouTube 聊天 DOM」那套做法。本项目只依赖发行版
-自带的系统库，没有浏览器、没有 Chromium/OBS 浏览器源，也不需要任何包管理器。
+It replaces the "OBS browser source plus a large blob of CSS reshaping the chat DOM" approach: the same picture, one process, zero child processes, none of it sitting in a browser.
 
-> 当前状态：B 站可用；Twitch 尚未实现（IRC 正在退役，EventSub 需要用户自带 token，见
-> [文档](#未做的事)）。
+- **A chat panel**, not scrolling danmaku: bottom-aligned, per-role colours, a colour bar on the left, hanging indent on wrap
+- **Avatars** are fetched live and cropped to a circle; **emote messages** are drawn from the inline images Bilibili hands over
+- **Gifts, entries and likes** all land in the same column: the gift verb (`投喂`) is gold, the gift name that stands in when the icon has not arrived is pink, and both belong to the gift class together with the left colour bar; entries and likes are dimmed so they do not compete with what was actually typed
+- **Repeated gifts from one viewer merge into a row**: within a window they are grouped by viewer *and* gift with the count summed (`×10`) instead of spamming one row per tap; entry notices merge the same way
+- **Paid messages are pinned on their own layer**: top-aligned, wrapped and never truncated, dwell time of 1 minute to 2 hours by amount, several at once
+- **Guard cards** are solid green and scroll with the list
+- **Entry animation**: a new message takes its slot immediately, pushes the old ones up, then slides in
+- **History across restarts**: `--history N` keeps the last N rows on disk and paints them back at the next start, above a rule that separates them from this session's live rows
+- **Fully transparent by default**, with outlines on the text only, so it stays legible over bright content
+- **Any text is rendered literally** — a `<script>` in the chat is glyphs, nothing is parsed as markup
+- Any output size (`WxH`) and an adjustable frame-rate ceiling
+- **Tune the layout without a live room**: `--demo` draws a fixed set of messages
 
-## 特性
+Every dependency is a system library from the distribution: no browser, no Chromium / OBS browser source, and no language package manager involved.
 
-- **聊天面板**，不是滚动弹幕：底部对齐、角色配色、左侧色条、折行缩进
-- **头像**实时下载并裁成圆形；**表情弹幕**按 B 站给的内联图片渲染
-- **礼物 / 入场 / 点赞**都画进同一列：礼物动词（`投喂`）走金色，礼物图未到时回退出来的礼物名走粉色，两者都和左侧色条同属礼物；入场与点赞压暗、不抢弹幕的注意力
-- **同一个人连投同一个礼物合成一行**：窗口内按「观看者 + 礼物」分组、数量累加（`×10`），不再一行一条地刷屏；入场 notice 同样合并
-- **醒目留言**独立置顶：顶边对齐、自动换行不省略、按金额停留 1 分钟～2 小时后淡出，可同时挂多条
-- **上舰卡片**：实心绿卡片，跟滚动列表一起走
-- **入场动画**：新消息立刻占位、把旧消息顶上去，再滑入
-- **跨重启的历史**：`--history N` 把最近 N 行写到磁盘，下次启动先画出来，并用一条分割线与本次的实时弹幕分开
-- **完全透明**，只有文字自带描边，叠在明亮画面上也读得清
-- **按字面渲染任何文本**——弹幕里出现的 `<script>` 就是字形，不做任何标记解析
-- 尺寸任意（`WxH`）、帧率上限可调
-- **不连网也能调版面**：`--demo` 渲染一组固定消息
+## Install
 
-## 构建
-
-依赖（Arch）：
+### From source
 
 ```bash
+# Dependencies (Arch)
 sudo pacman -S --needed base-devel cairo pango gdk-pixbuf2 libpipewire curl openssl \
                    brotli zlib
-git submodule update --init --recursive   # 视频节点库是子模块
-make                                      # -> ./pw-live-danmaku
-make PORTABLE=1                           # 同上，但不加 -march=native（分发或换机器时用）
+
+git submodule update --init --recursive   # the video-node library is a submodule
+make                                      # → ./pw-live-danmaku
+make PORTABLE=1                           # the same, without -march=native (distribution)
 ```
 
-视频节点实现来自 [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface)
-（git 子模块），与姊妹项目 `pw-mpris-visualcard` 共用同一个 pin。
+`make` fails with an explicit message if the submodule is not checked out. The video node comes from [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface) (a git submodule), pinned to the same commit as the sibling project `pw-mpris-visualcard`. There is no AUR package yet.
 
-## 在 OBS 里使用
+Architecture, build flags, the other `make` targets, repository layout and the dependency licences are in [docs/development.md](docs/development.md).
 
-OBS 自带的 `linux-pipewire` 走 xdg-desktop-portal，只能捕获屏幕与窗口，**选不到本节点**；
-需要配合插件 [**obs-pwvideo**](https://github.com/tasokait/obs-pwvideo)。
+## Usage
 
-1. 来源 **+** → **PipeWire Video**
-2. 下拉框里选 **Live Chat**
-   - 下拉框**显示的是节点描述**（`--desc`），实际连接的是节点名（`--node`）——这是两个不同字段
-   - 插件只在**打开属性对话框那一刻**枚举一次节点；列表里没有的话，确认进程在跑，然后关掉再打开对话框
-3. **把源的宽高设成和 `--size` 完全一致**（默认 `480x1080`）
-   - ⚠️ 协商尺寸比配置小的时候画面是**被裁掉**，不是等比缩小。尺寸不一致就会缺一块
-4. 叠加到场景上即可，背景本来就是透明的
-
-## 用法
+### Run it
 
 ```bash
 ./pw-live-danmaku --room 545068
-./pw-live-danmaku --room https://live.bilibili.com/545068    # 短链 b23.tv 也可以
-./pw-live-danmaku --demo --dump /tmp/panel.png               # 不连网调版面
+./pw-live-danmaku --room https://live.bilibili.com/545068    # a b23.tv short link also works
 ```
 
-开机自启：
+The node name (default `pw-live-danmaku`) is printed to the terminal.
+
+### Add it to OBS
+
+OBS ships `linux-pipewire`, which goes through xdg-desktop-portal, can only capture screens and windows, and therefore **cannot select this node**. Use the [**obs-pwvideo**](https://github.com/tasokait/obs-pwvideo) plugin instead.
+
+1. Sources **+** → **PipeWire Video** (provided by `obs-pwvideo`).
+2. Select **Live Chat**. The dropdown displays the node description (`--desc`, default `Live Chat`) and connects to the node name (`--node`, default `pw-live-danmaku`); the two are separate fields. obs-pwvideo enumerates nodes when the properties dialog is opened and does not refresh an open dialog; if the node is absent, confirm the process is running and reopen it.
+3. **Set the source width and height to exactly `--size`** (default `480x1080`). A smaller negotiated size is **clipped, not scaled** — a mismatch loses part of the panel.
+4. Overlay it on the scene; the background is transparent to begin with.
+
+### Autostart
+
+`pw-live-danmaku.service` is a template holding `@REPO@` and `@ARGS@`, so it is rendered rather than copied at install time:
 
 ```bash
-make install-service                             # 渲染 unit 到 ~/.config/systemd/user/
-systemctl --user enable --now pw-live-danmaku
-systemctl --user restart pw-live-danmaku         # 改过参数后重启才生效
+make install-service                            # render into ~/.config/systemd/user/
+make install-service SERVICE_ARGS="--room 545068 --size 480x1080 --fps 30 --history 60"
+make uninstall-service
+systemctl --user enable --now pw-live-danmaku   # enabling and starting is still yours
+systemctl --user restart pw-live-danmaku        # restart after changing the arguments
 ```
 
-## 昵称默认是掩码的
+`make install-service` writes the unit and runs `daemon-reload`; it never enables or starts anything. With a cookie, write paths as systemd's `%h`, not `~` — **systemd does not expand `~`** — or the unit dies and restarts every 3 seconds. The unit also carries `StateDirectory=pw-live-danmaku` so `--history` has somewhere writable. Both explained in [docs/cookies.md](docs/cookies.md).
 
-未登录连接拿得到弹幕正文、颜色、头像和表情，但 B 站会对**昵称**打码（`为保护用户隐私`）。
-要真昵称，从浏览器 devtools 里拷一份 cookie：
+### Verify it without OBS
 
 ```bash
+./pw-live-danmaku --demo --dump /tmp/panel.png                       # fake data, no network
+./pw-live-danmaku --room 545068 --dump /tmp/x.png --count 3 -v      # real chat, exit after 3 rows
+make verify                                                          # attach a consumer, land the frames
+make test                                                           # protocol and history-format tests
+```
+
+## Nicknames are masked unless you log in
+
+An anonymous connection gets message bodies, colours, avatars and emotes, but Bilibili masks the **nickname** (`为保护用户隐私`). For real nicknames, copy a cookie out of the browser devtools and keep it in a file:
+
+```bash
+mkdir -p ~/.config/pw-live-danmaku
 printf '%s' 'SESSDATA=...; bili_jct=...; DedeUserID=...' > ~/.config/pw-live-danmaku/cookie
 chmod 600 ~/.config/pw-live-danmaku/cookie
 ./pw-live-danmaku --room 545068 --cookie-file ~/.config/pw-live-danmaku/cookie
 ```
 
-`--cookie-file` 推荐而不是 `--cookie`：后者会把会话写进进程参数，任何本地用户都能从
-`ps(1)` 读到。两种方式下 cookie 都不会被写进日志。
+`--cookie-file` is preferred over `--cookie`: the latter puts the session in the process arguments, where any local user can read it out of `ps(1)`. Neither form ever writes the cookie to the log.
 
-**打码不是全局的**：实测同一条匿名连接上，弹幕与入场的昵称被打码，而**点赞**与站方的入场动画
-事件给的是实名。所以未登录时画面上仍然会有几个真名。理由与实测数字见
-[docs/internals.md](docs/internals.md#这两个反直觉的实测结果)。
+**The masking is not global**: on the same anonymous connection, entry notices and chat messages come back masked while **likes** and the site's own entry animations carry real names, so an unauthenticated overlay still shows a few real names. Which fields the cookie needs, how to write the path in a unit, and why the program expands `~` itself are in [docs/cookies.md](docs/cookies.md); the measurements behind that claim are in [docs/internals.md](docs/internals.md#两个反直觉的实测结果).
 
-## 参数
+## Options
 
-| 参数 | 默认 | 说明 |
+### Room and identity
+
+| Option | Default | Description |
 | --- | --- | --- |
-| `--room ID\|URL` | 必填 | 房间号或直播间 URL；`b23.tv` 短链也能解析 |
-| `--cookie STR` | | cookie 字符串。会进 `ps(1)`，程序会警告 |
-| `--cookie-file PATH` | | 从文件读 cookie（推荐，可 `chmod 600`）。开头的 `~` 会展开为 `$HOME` |
-| `--font NAME[,...]` | CJK 回退链 | pango 逐字符回退，拉丁与中文字体可以串成一条链 |
-| `--font-size N` | `28` | 聊天区字号（用户名与正文）。头像框随之为一行文字高 |
-| `--card-font-size N` | `30` | 醒目留言 / 舰长卡片内的字号 |
-| `--font-file PATH` | | 启动时把字体文件注册进 fontconfig；可重复 |
-| `--entry-merge MS` | `5000` | 入场事件合并窗口：这段时间内进来的人合成一行（`某某 等 7 人进入了直播间`）。实测热闹房间里入场是 1.57 条/秒、弹幕 0.36 条/秒，全量显示会把弹幕淹掉。**`0` = 不合并，每人一行** |
-| `--gift-merge MS` | `3000` | 礼物合并窗口：同一个人在这段时间里投同一个礼物，合成一行并累加数量（`投喂 人气票 ×10`）。礼物按钮是连点的，一次连点十次就会刷掉十行弹幕。键是**观看者 + 礼物**，所以一个人投两种礼物仍是两行；头像也在键里，因为匿名连接下昵称都被打码成同样的形状。行要等窗口走完才画，所以单独一个礼物最多晚这么多出现。**`0` = 不合并，一个一行** |
-| `--node NAME` | `pw-live-danmaku` | PipeWire 节点名 |
-| `--desc TEXT` | `Live Chat` | 节点描述，**OBS 下拉框里显示的就是它** |
-| `--size WxH` | `480x1080` | 输出尺寸。**OBS 源尺寸必须与之一致** |
-| `--fps N` | `30` | 帧率上限；消费者可协商更低 |
-| `--demo` | | 渲染固定消息，不连网 |
-| `--dump FILE` | | 出一张 PNG 后退出（会等头像与表情下载完） |
-| `--count N` / `--seconds N` | `0` | 画了 N 行 / 跑 N 秒后退出。`--count` 数的是**进入面板的行**，所以被 `--entry-merge` / `--gift-merge` 折叠掉的事件不计入 |
-| `--history N` | `0` | 持久化最近 N 行，下次启动先画出来，中间一条分割线。**`0` = 不持久化**。醒目留言不入库：它按金额算停留时间，把昨天的那条重新置顶是对付费时间撒谎 |
-| `--history-file PATH` | `$XDG_STATE_HOME/pw-live-danmaku/history.json` | 历史文件位置；开头的 `~` 会展开为 `$HOME`。写入是原子的（临时文件 + `rename`），读取失败不会阻止启动 |
-| `--history-label TEXT` | `上次` | 分割线上的文字；传空字符串则只画线 |
-| `--verbose`, `-v` | | 协议握手、每条消息、头像与表情的下载计数 |
+| `--room ID\|URL` | required | Room number or room URL; a `b23.tv` short link resolves too |
+| `--cookie STR` | | Raw cookie header. Visible in `ps(1)`, and the program warns about it |
+| `--cookie-file PATH` | | Read the cookie from a file (recommended, can be `chmod 600`). A leading `~` is expanded to `$HOME`. Details in [docs/cookies.md](docs/cookies.md) |
 
-## 跨启动的历史
+### Layout and fonts
 
-```bash
-./pw-live-danmaku --room 545068 --history 60        # 记住最近 60 行
-systemctl --user restart pw-live-danmaku             # 下次启动：旧消息在上，分割线，新消息在下
-```
+The panel is laid out inside the canvas `--size` gives it: the width sets the wrap width, the height decides how many rows fit. Row height follows `--font-size` and **is not scaled to the height** — ask for a denser panel by asking for a smaller font.
 
-行为上的四点，都是踩过才知道的：
+| Option | Default | Description |
+| --- | --- | --- |
+| `--size WxH` | `480x1080` | Output size. **The OBS source size must match**: a smaller negotiated size is clipped, not scaled |
+| `--font NAME[,...]` | CJK fallback chain | Font family chain, resolved per character by pango, so a Latin family can be paired with a CJK one |
+| `--font-size N` | `28` | Chat text size in px, for the username and the body. The avatar box follows it: it is always one line tall |
+| `--card-font-size N` | `30` | Card text size in px, for the paid and membership card lines |
+| `--font-file PATH` | | Register a font file (or a directory) with fontconfig at startup, for this process only. Repeatable |
 
-- **写入是原子的**：先写同目录下的临时文件再 `rename`。写到一半掉电只会丢掉这一批，上一份还在；
-  半截文件是解析不出任何东西的文件。
-- **节流**在调用方：攒够 8 行或者 2 秒才落一次盘，退出前再落一次。落盘失败只警告一次并关掉本轮
-  的历史，**不会**每条消息刷一行日志。
-- **窗口跨重启是连续的**：启动时读回的历史会填进同一个窗口，所以只跑了 2 分钟的那一次不会把上
-  一次留下的历史挤成 2 行。
-- **历史按房间分**：文件里记着房间号，换房间读同一文件会被跳过并说明原因，不会把两个直播间的聊
-  天混在一起。
+### Message merging
 
-systemd 装法里的 unit 已经带了 `--history 60`，并用 `StateDirectory=pw-live-danmaku` 把
-`~/.local/state/pw-live-danmaku/` 设为可写——否则 `ProtectHome=read-only` 会让写盘失败（失败也不
-影响运行，只是没有历史）。删历史直接 `rm` 那个文件即可。
+| Option | Default | Description |
+| --- | --- | --- |
+| `--entry-merge MS` | `5000` | Entry-notice merge window: everyone who arrives within it becomes one row (`某某 等 7 人进入了直播间`). Measured in a busy room, entries arrive at 1.57/s against 0.36/s of chat, so one row each pushes most of what was typed off the top. `0` gives every notice its own row |
+| `--gift-merge MS` | `3000` | Gift merge window: one viewer sending the same gift within it becomes one row with the count summed (`投喂 人气票 ×10`). Gift buttons are tapped repeatedly — ten taps would otherwise push ten real messages off the top. The key is **viewer + gift**, so one viewer sending two gifts is still two rows; the avatar is in the key too, because anonymous connections mask nicknames into the same few shapes. The row waits out the window, so a lone gift appears this much late. `0` gives every gift its own row |
 
-## 性能
+### History across restarts
 
-默认 480×1080 @30fps、消费者接满、实测：
+| Option | Default | Description |
+| --- | --- | --- |
+| `--history N` | `0` | Keep the last N rows on disk and paint them back at the next start, above a rule. `0` is off: nothing is written or read |
+| `--history-file PATH` | `$XDG_STATE_HOME/pw-live-danmaku/history.json` | Where the history lives; a leading `~` is expanded to `$HOME` |
+| `--history-label TEXT` | `上次` | Text on the rule between restored and live rows; empty draws the rule alone |
 
-```text
-window        : 30.0 s
-frames pushed : 900  -> 30.0 fps
-cpu           : 0.900 s  -> 3.00% of one core
-per frame     : 1.000 ms
-private memory: 94 MB
-```
+Paid messages are not kept: they are pinned with a dwell clock, and re-pinning yesterday's would be a lie about when it was paid. The behaviour — atomic writes, throttling, per-room files, the writable directory the unit needs — is in [docs/history.md](docs/history.md).
 
-**没有消费者连接时，渲染回调一次都不会被调用**，面板侧开销为零。
+### Output and diagnostics
 
-做法是：文字排好后就不再变，所以整幅画面累积在一张静态层表面上，每来一条消息只把它上移一行
-再在新露出的条带里画这一条——每条消息的开销正比于它自己的高度，而不是面板。头像和入场动画
-那一条每帧重画，代价是几十个小圆盘。
+| Option | Default | Description |
+| --- | --- | --- |
+| `--node NAME` | `pw-live-danmaku` | PipeWire node name; this is the value behind the OBS dropdown entry |
+| `--desc TEXT` | `Live Chat` | Node description. **This is what the OBS dropdown displays**, not `--node` |
+| `--fps N` | `30` | Frame-rate ceiling; consumers may negotiate lower, never higher |
+| `--count N` / `--seconds N` | `0` | Exit after drawing N rows / running N seconds. `--count` counts the rows that **reach the panel**, so events folded away by `--entry-merge` or `--gift-merge` do not count |
+| `--demo` | | Draw a fixed set of messages and no network at all. Overrides `--room` |
+| `--dump FILE` | | Render one sample frame to PNG and exit (it waits for avatars and emotes to download) |
+| `--verbose`, `-v` | | Log the protocol handshake, every message, and the avatar / emote download counters |
+| `--help`, `-h` | | Print a short option summary |
 
-## 文档
+## Performance
 
-| 文档 | 内容 |
+| Metric | Value |
 | --- | --- |
-| [docs/internals.md](docs/internals.md) | **改代码前先读**。协议实测结论、与社区文档相反的地方、踩过的坑与实测数据、调试命令 |
+| CPU | **≈3.0% of one core** (`480x1080` at 30fps, with a consumer attached) |
+| Per frame | ≈1.0 ms |
+| With no consumer attached | the render callback is not called at all, so the panel costs nothing |
+| Private (anonymous) memory | **94 MB** |
+| Child processes | **0** |
 
-本文与代码均在 LLM 辅助下编写。所有结论都经过实机复现——未经复现的推测不收录。
+The trick is that laid-out text never changes again, so the whole picture accumulates on one static surface; each new message shifts it up by a row and draws itself in the strip that just became visible — **each message costs its own height, not the panel's**. Avatars and the animating row are redrawn every frame, which is a few dozen small discs. The measurement window, the breakdown of where the time goes and which knob moves which part are in [docs/performance.md](docs/performance.md).
 
-## 未做的事
+## Documentation
 
-- **Twitch**：IRC 正在退役（社区标注 2026-09-02 deprecated），需要迁到 EventSub，而
-  EventSub 读聊天要求用户自带带 `user:read:chat` 的 token。架构上已为它留好接口
-  （`Site` 抽象、`Fragment` 里的表情片段），但实现还没写。
-- **房间自动识别**：目前需要手填房间号。浏览器的媒体会话拿不到房间号（Firefox 的
-  `xesam:url` 是 blob:），Chromium 系在 Linux 上没有 MPRIS。
-- **断线重连**：目前失败即退出并把原因打在面板状态里。
-- **热门房间的洪峰**：已有界队列（400）与每帧上限（40）兜底，但丢弃策略未在高流量下验证。
-- `README.en.md`：暂无英文版。
+| Document | For | Contents |
+| --- | --- | --- |
+| [docs/internals.md](docs/internals.md) | developers | Protocol findings, places where the community docs are wrong, pitfalls and measurements, debug commands — **read before changing code** |
+| [docs/performance.md](docs/performance.md) | users, packagers | Measured CPU and memory, where the time goes, cutting CPU |
+| [docs/history.md](docs/history.md) | users, developers | Using the cross-restart history, and how it behaves |
+| [docs/cookies.md](docs/cookies.md) | users | Getting a cookie, passing it safely, `%h` versus `~` in a unit |
+| [docs/development.md](docs/development.md) | contributors, packagers | Architecture, build flags and targets, repository layout, tests, dependency licences |
 
-## 许可
+The `docs/` articles are Chinese-only for now; both READMEs are maintained.
 
-MIT。运行期使用的系统库均为动态链接，未捆绑、未修改其代码。视频节点实现取自
-`pw-video-simple-interface`（同为 MIT）。OBS 侧的 `obs-pwvideo` 是 GPLv2 的独立程序，
-与本项目之间只有 PipeWire 节点的运行时数据流，不构成链接或派生关系。
+## Not implemented
+
+- **Twitch**: IRC is being retired (community-marked deprecated on 2026-09-02) and would have to move to EventSub, where reading chat needs a user-supplied token with `user:read:chat`. The architecture already has the seams for it (the `Site` abstraction, emote fragments), but no implementation exists yet. **Bilibili is the only working site today.**
+- **Automatic room detection**: the room number has to be given by hand. A browser media session cannot supply it (Firefox reports a `blob:` `xesam:url`), and Chromium has no MPRIS on Linux.
+- **Reconnection**: a failed connection exits and prints the reason onto the panel.
+- **Floods in popular rooms**: there are bounds (a 400-entry queue and a 40-row-per-frame cap), but the drop policy has not been verified under real load.
+- The **length cap on paid messages** (40 characters at CN¥30 up to 100 at CN¥2000) is not implemented: that is a sender-side limit, and the renderer only has to show what arrived.
+- **Voice messages** (`dm_type == 2`) are not decoded; the body is drawn as ordinary text.
+
+The full list, with the reasoning for each item, is in [docs/internals.md](docs/internals.md#未实测--已知缺口).
+
+## License
+
+Released under the **MIT License**, copyright **ZokuTe** (from 2026); see [LICENSE](LICENSE) for the full text.
+
+The system libraries used at runtime are dynamically linked, none of their code is bundled or modified, and each remains under its own licence — the table is in [docs/development.md](docs/development.md). [obs-pwvideo](https://github.com/tasokait/obs-pwvideo) on the OBS side is a separate GPLv2 program whose only interaction with this project is the runtime data flow through a PipeWire node — no linking, no derivative work — so the two licences do not affect each other.
+
+The video node itself comes from [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface), a git submodule (MIT).
