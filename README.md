@@ -7,6 +7,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational?style=flat-square" alt="MIT License"></a>
+<a href="https://aur.archlinux.org/packages/pw-live-danmaku-git"><img src="https://img.shields.io/badge/AUR-pw--live--danmaku--git-informational?style=flat-square" alt="AUR package"></a>
 <img src="https://img.shields.io/badge/platform-Linux-informational?style=flat-square" alt="Linux">
 
 </div>
@@ -44,6 +45,23 @@ Every dependency is a system library from the distribution: no browser, no Chrom
 
 ## Install
 
+### From the AUR
+
+```bash
+paru -S pw-live-danmaku-git     # or: yay -S pw-live-danmaku-git
+```
+
+The binary is `pw-live-danmaku` and lands on `PATH`, so there is no checkout to maintain. The package provides and conflicts with `pw-live-danmaku`, ships `x86_64` and `aarch64`, and follows the latest commit. It builds with `PORTABLE=1` and additionally strips `-march=native` out of the builder's own `CXXFLAGS`: a builder with a customised `makepkg.conf` would otherwise install a binary bound to the CPU it was built on, which dies with SIGILL on another machine. The video-node library is fetched as a second source, so no submodule checkout is needed. `obs-pwvideo` and a CJK font (`noto-fonts-cjk`) are optional dependencies.
+
+The unit is rendered at `/usr/lib/systemd/user/pw-live-danmaku.service` with upstream's Makefile defaults, **which include upstream's own room number — change it**:
+
+```bash
+systemctl --user enable --now pw-live-danmaku
+systemctl --user edit pw-live-danmaku    # override ExecStart=
+```
+
+Removal: `pacman -Rns pw-live-danmaku-git`. Do not run `make install-service` on that install: it writes to `~/.config/systemd/user/`, which shadows the packaged unit.
+
 ### From source
 
 ```bash
@@ -56,7 +74,7 @@ make                                      # → ./pw-live-danmaku
 make PORTABLE=1                           # the same, without -march=native (distribution)
 ```
 
-`make` fails with an explicit message if the submodule is not checked out. The video node comes from [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface) (a git submodule), pinned to the same commit as the sibling project `pw-mpris-visualcard`. There is no AUR package yet.
+`make` fails with an explicit message if the submodule is not checked out. The video node comes from [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface) (a git submodule), pinned to the same commit as the sibling project `pw-mpris-visualcard`.
 
 Architecture, build flags, the other `make` targets, repository layout and the dependency licences are in [docs/development.md](docs/development.md).
 

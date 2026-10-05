@@ -7,6 +7,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational?style=flat-square" alt="MIT License"></a>
+<a href="https://aur.archlinux.org/packages/pw-live-danmaku-git"><img src="https://img.shields.io/badge/AUR-pw--live--danmaku--git-informational?style=flat-square" alt="AUR package"></a>
 <img src="https://img.shields.io/badge/platform-Linux-informational?style=flat-square" alt="Linux">
 
 </div>
@@ -42,7 +43,30 @@
 
 依赖只有发行版自带的系统库：没有浏览器、没有 Chromium / OBS 浏览器源，也不涉及任何语言包管理器。
 
-## 构建
+## 安装
+
+### 从 AUR 安装
+
+```bash
+paru -S pw-live-danmaku-git     # 或 yay -S pw-live-danmaku-git
+```
+
+二进制名为 `pw-live-danmaku`，装好后已在 `PATH` 中，无需自己维护一份仓库。该包提供并冲突于
+`pw-live-danmaku`，支持 `x86_64` 与 `aarch64`，随最新提交更新。它以 `PORTABLE=1` 构建，并额外从
+构建者自己的 `CXXFLAGS` 里再剥一遍 `-march=native`——否则用了自定义 `makepkg.conf` 的构建者会装到一个
+绑定本机指令集的二进制，换台机器就是 SIGILL。视频节点库作为第二个 source 拉取，不需要子模块检出。
+`obs-pwvideo` 与 CJK 字体（`noto-fonts-cjk`）是可选依赖。
+
+unit 已渲染好放在 `/usr/lib/systemd/user/pw-live-danmaku.service`，参数是上游 Makefile 的默认值——
+**其中含上游自己的房间号，要换成自己的**：
+
+```bash
+systemctl --user enable --now pw-live-danmaku
+systemctl --user edit pw-live-danmaku    # 覆盖 ExecStart=
+```
+
+卸载：`pacman -Rns pw-live-danmaku-git`。这种情况下不要跑 `make install-service`：它写出的 unit 落在
+`~/.config/systemd/user/`，会遮蔽包里的那一份。
 
 ### 从源码安装
 
@@ -56,7 +80,7 @@ make                                      # → ./pw-live-danmaku
 make PORTABLE=1                           # 同上，但不加 -march=native（分发或换机器时用）
 ```
 
-未初始化子模块时 `make` 会带明确提示直接报错。视频节点实现来自 [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface)（git 子模块），与姊妹项目 `pw-mpris-visualcard` 共用同一个 pin。暂未打包进 AUR。
+未初始化子模块时 `make` 会带明确提示直接报错。视频节点实现来自 [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface)（git 子模块），与姊妹项目 `pw-mpris-visualcard` 共用同一个 pin。
 
 架构、构建参数、各 `make` 目标、目录结构与依赖许可见 [docs/development.md](docs/development.md)。
 
