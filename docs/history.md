@@ -93,6 +93,33 @@ unit 里有 `ProtectHome=read-only`，`~/.local/state` 也在其中，所以光�
 `StateDirectory=pw-live-danmaku` 建目录并只给这一个目录写权限。即便这条被删掉，程序也只是
 「没有历史」而不会启动失败——**写盘失败只警告一次并关掉本轮历史**，不会每条消息刷一行日志。
 
+### 九、自定义 `--history-file`：`ProtectHome=read-only` 一样会锁住
+
+`StateDirectory=` 只放行它自己那一个目录。把 `--history-file` 指到 `$HOME` 下的别处——最容易踩
+的就是和 cookie 做邻居，`%h/.config/pw-live-danmaku/history.json`——那个目录仍然是只读的，第一次
+写盘就失败：
+
+```text
+[history] cannot write /home/.../.config/pw-live-danmaku/history.json.tmp: Read-only file system
+[history] history is off for the rest of this run
+```
+
+症状是启动横幅永远 `0 restored`；房间没开播时连上面那两行都要等到下一条弹幕才出现，所以只看横幅
+很容易以为历史功能没实现。修法是给那个目录单独开权限：
+
+```ini
+ReadWritePaths=-%h/.config/pw-live-danmaku
+```
+
+一个 systemd 的坑：**同一个路径不要同时出现在 `ReadOnlyPaths=` 和 `ReadWritePaths=` 里**——完全
+相同的路径会让只读那一边生效，`ReadWritePaths=` 被顶掉，写盘照旧失败。unit 模板里那行
+`ReadOnlyPaths=-%h/.config/pw-live-danmaku` 是给 cookie 的，要写这个目录就得去掉它、或收窄成
+`-%h/.config/pw-live-danmaku/cookie`。收窄只解决「互相顶掉」，不保证 cookie 还是只读：父目录一旦
+可写，subpath 的只读在实测里拦不住——好在那个目录本来就只有这个服务在写。
+
+改完 unit 要 `systemctl --user daemon-reload` 再 `systemctl --user restart pw-live-danmaku`，
+`systemd-analyze --user verify <unit>` 可以先验证语法。
+
 ## 端到端复现
 
 手写一份历史文件，让程序读回来并与真实弹幕叠在一起：
