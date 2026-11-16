@@ -672,8 +672,8 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     return true;
   }
 
-  // Two of the events stopped being JSON. INTERACT_WORD_V2 (somebody entered the room) and
-  // SEND_GIFT_V2 (a gift) now carry exactly one field besides `cmd` and `dmscore`: `data.pb`, a
+  // Two of the events stopped being JSON. INTERACT_WORD_V2 (somebody entered, followed or shared)
+  // and SEND_GIFT_V2 (a gift) now carry exactly one field besides `cmd` and `dmscore`: `data.pb`, a
   // base64 protobuf message. That is the whole payload, so a reader that only knew about JSON saw
   // these documents as empty and dropped them -- which is what happened before this milestone, and
   // why the events looked like a network problem rather than a parser one.
@@ -681,18 +681,41 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     std::string blob;
     if (!base64Decode(json["data"]["pb"].str(), blob)) return false;
     const pb::Message root(blob);
-    // Field 2 is the nickname, 8 the millisecond timestamp. Both were present in 110 of 110
-    // captures in room 21852; the field numbers are pinned by tests/bili_test.cpp.
+    // Field 2 is the nickname, 5 the interaction type, 8 the millisecond timestamp. Fields 2 and 8
+    // were present in 110 of 110 captures in room 21852; field 5 is the community schema's msg_type
+    // and was 1 in the sample this project captured. The field numbers are pinned by
+    // tests/bili_test.cpp.
     out.user = std::string(root.str(2));
     // A row with no nickname has nothing to identify the viewer with, so it is dropped rather than
     // shown as an unattributed notice.
     if (out.user.empty()) return false;
-    out.kind = MsgKind::Entry;
+
+    // Field 5 is msg_type. The community-maintained InteractWordV2 schema is 1 enter, 2 follow,
+    // 3 share. This is the whole reason the three were indistinguishable before: the old code
+    // stamped every one of them Entry, so a follow was drawn as "进入了直播间". Anything outside the
+    // known values is dropped rather than guessed at -- claiming an entry for an event this build
+    // does not know is exactly the bug being fixed.
+    switch (root.num(5)) {
+      case 1:
+        out.kind = MsgKind::Entry;
+        out.parts.push_back(Fragment{Fragment::Kind::Text, entryBody(1), "", 0});
+        break;
+      case 2:
+        out.kind = MsgKind::Follow;
+        out.parts.push_back(Fragment{Fragment::Kind::Text, "关注了主播", "", 0});
+        break;
+      case 3:
+        out.kind = MsgKind::Share;
+        out.parts.push_back(Fragment{Fragment::Kind::Text, "分享了直播间", "", 0});
+        break;
+      default:
+        return false;
+    }
     out.tsMs = static_cast<int64_t>(root.num(8));
-    out.parts.push_back(Fragment{Fragment::Kind::Text, entryBody(1), "", 0});
     // No face on purpose. The one is at field 22.2.2, and it is not read: entries arrive several
     // times a second and each is a different viewer, so the column would be a strip of
-    // single-use faces the avatar cache could never keep -- mostly the site's default one.
+    // single-use faces the avatar cache could never keep -- mostly the site's default one. Follows
+    // and shares are rarer, but they are drawn in the same ambient column and keep the same rule.
     return true;
   }
 
@@ -802,6 +825,10 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     out.user = user["uname"].str();
     out.avatarUrl = httpsUrl(user["face"].str());
     out.tsMs = static_cast<int64_t>(d["start_time"].num() * 1000);
+    // `time` is the duration the sender bought, in seconds. The panel prefers it when the payload
+    // carries one and falls back to its price table when it does not.
+    const int64_t seconds = d["time"].num();
+    if (seconds > 0) out.durationMs = seconds * 1000;
     const int64_t price = d["price"].num();
     if (price > 0) {
       out.amount = "CN¥" + std::to_string(price);
@@ -825,6 +852,10 @@ bool Bili::parseMessage(const Json& json, Message& out) {
     // price is in gold, and 1000 gold is one yuan.
     const int64_t gold = d["price"].num();
     const int64_t level = d["guard_level"].num();
+    out.guardLevel = static_cast<int>(level);
+    // The panel shows this as a display string, but the feed sends a number; carry the magnitude
+    // beside the string for the same reason paid messages carry amountValue.
+    if (gold > 0) out.amountValue = gold / 1000;
     std::string label;
     if (level == 3) label = "舰长";
     else if (level == 2) label = "提督";
@@ -860,6 +891,9 @@ bool EntryMerger::flushAll(Message& out) {
   out = head_;
   out.parts.clear();
   out.parts.push_back(Fragment{Fragment::Kind::Text, entryBody(pending_), "", 0});
+  // The row stands for `pending_` people. The sentence and the number are the same fact in two
+  // forms; the wire sends both so a consumer can read the count without parsing Chinese.
+  out.count = pending_;
 
   if (windowMs_ > 0) {
     pending_ = 0;

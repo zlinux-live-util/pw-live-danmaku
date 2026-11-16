@@ -40,11 +40,17 @@ enum class MsgKind {
   Membership,
   /** A gift (billibili SEND_GIFT_V2 / twitch cheer). Drawn like chat, with its own bar colour. */
   Gift,
-  /** Somebody entered the room (billibili INTERACT_WORD_V2). Ambient: dimmed, no bar, no avatar. */
+  /** Somebody entered the room (billibili INTERACT_WORD_V2 msg_type 1). Ambient: dimmed, no bar,
+   *  no avatar. */
   Entry,
   /** Somebody liked the stream (billibili LIKE_INFO_V3_CLICK). Ambient, but the face is kept: the
    *  site's own like notice shows one, and a like is deliberate rather than incidental. */
   Like,
+  /** Somebody followed the streamer (billibili INTERACT_WORD_V2 msg_type 2). Ambient like Entry:
+   *  dimmed, no bar, no avatar, one row per follow. */
+  Follow,
+  /** Somebody shared the room (billibili INTERACT_WORD_V2 msg_type 3). Ambient like Entry. */
+  Share,
 };
 
 /** Whether a kind is a card: the two paid kinds, and only those.
@@ -96,6 +102,15 @@ struct Message {
    *  recovering that from "CN¥1980" would mean parsing a display string back into a number. A site
    *  that bills in a different unit sets it to what its own table is denominated in. */
   int64_t amountValue = 0;
+
+  /** How long the site itself says a paid message should stay pinned, in milliseconds; 0 when the
+   *  payload did not carry a duration. The site's own number is preferred over a local price table
+   *  when it exists, because it is the time the sender actually bought. */
+  int64_t durationMs = 0;
+
+  /** The guard tier a membership purchase names: 1 总督, 2 提督, 3 舰长; 0 when unknown. The panel
+   *  only needs to know whether this is a membership at all, but the feed has to say which one. */
+  int guardLevel = 0;
 
   /** How many of one thing this row stands for: 6 for a gift of six, 1 for a single one. Zero means
    *  "not a counted row", and is counted as one wherever a count is taken.

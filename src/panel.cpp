@@ -123,7 +123,10 @@ uint32_t Panel::nameColor(UserType t) const {
 }
 
 double Panel::rowAlpha(MsgKind k) const {
-  return (k == MsgKind::Entry || k == MsgKind::Like) ? tok_.dimAlpha : 1.0;
+  return (k == MsgKind::Entry || k == MsgKind::Like || k == MsgKind::Follow ||
+          k == MsgKind::Share)
+             ? tok_.dimAlpha
+             : 1.0;
 }
 
 double Panel::textX(MsgKind k) const {
@@ -168,6 +171,32 @@ double Panel::cardHeight(const Message& m, cairo_t* cr, double w) const {
   return content + tok_.rowGap * 3.0;
 }
 
+Panel::BodyFit Panel::fitBody(cairo_t* cr, const std::string& text,
+                              const pwvideo::LabelSpec& base, double inlineWidth,
+                              double fullWidth) const {
+  BodyFit fit;
+  pwvideo::LabelSpec spec = base;
+  spec.sizePx = tok_.fontBody;
+  spec.maxLines = 8;
+
+  // The gap after "name:" is part of what the first line has to fit, so it is taken off the inline
+  // width by the caller and applied again when painting. Leaving it out would wrap one word too
+  // late; applying it twice would wrap one word too early.
+  spec.widthPx = std::max(20.0, inlineWidth);
+  fit.layout = text_.layout(cr, text, spec);
+  fit.lines = std::max(1, pango_layout_get_line_count(fit.layout));
+  if (fit.lines <= 1) return fit;
+
+  // It does not fit beside the name, so it gets the row's whole width on the line below instead.
+  // Note that this can *reduce* the line count as well as widen each line: a body that needed two
+  // narrow lines beside the name often needs one wide line here, which is the point.
+  fit.stacked = true;
+  spec.widthPx = std::max(20.0, fullWidth);
+  fit.layout = text_.layout(cr, text, spec);
+  fit.lines = std::max(1, pango_layout_get_line_count(fit.layout));
+  return fit;
+}
+
 double Panel::measureRow(const Message& m, cairo_t* cr, bool* cardOut) const {
   const bool card = isCard(m.kind);
   if (cardOut) *cardOut = card;
@@ -176,9 +205,9 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* cardOut) const {
   }
 
   // Must agree with paintRow about where the body wraps, or a row is allocated too short and its
-  // last line is overwritten by whatever is drawn next. The name sits on the first line, so the
-  // body wraps at (available minus the name) for that line; the name width has to be measured
-  // here for the same reason paintRow measures it.
+  // last line is overwritten by whatever is drawn next. The branch -- body beside the name or under
+  // it -- comes from fitBody(), which both this and paintRow call; the name width has to be
+  // measured here for the same reason paintRow measures it before asking.
   pwvideo::LabelSpec spec;
   spec.family = tok_.font;
   spec.center = false;
@@ -192,17 +221,13 @@ double Panel::measureRow(const Message& m, cairo_t* cr, bool* cardOut) const {
 
   const double avail = static_cast<double>(width_) - textX(m.kind) - tok_.padRight;
 
-  spec.sizePx = tok_.fontBody;
-  // The gap after "name:" is part of what the first line has to fit, so it is subtracted here as
-  // well as being applied when painting. Measuring without it would wrap one word too late and
-  // measureRow would allocate the row a line too short.
-  spec.widthPx = std::max(20.0, avail - nw - tok_.nameBodyGap);
-  spec.maxLines = 8;
   // Count lines on the laid-out string, emotes included: a line of nothing but an emote still takes
   // a line, and plainText() would measure a different string than the one actually drawn.
   const InlineBody body = buildBody(m);
-  PangoLayout* l = text_.layout(cr, body.text, spec);
-  const int lines = std::max(1, pango_layout_get_line_count(l));
+  const BodyFit fit =
+      fitBody(cr, body.text, spec, avail - nw - tok_.nameBodyGap, avail);
+  // A stacked body adds the name's own line above it.
+  const int lines = fit.lines + (fit.stacked ? 1 : 0);
   const double textH = static_cast<double>(lines) * lineAdvance();
   return std::max(textH, avatarBox()) + tok_.rowGap;
 }
@@ -388,7 +413,8 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
     return ly - y + pad;  // the bottom padding closes the card
   }
 
-  // Plain line: the role-coloured bar at the far left, then a gap for the avatar, then "name: body".
+  // Plain line: the role-coloured bar at the far left, then a gap for the avatar, then "name: body"
+  // -- and, when the body will not fit beside the name, "name:" with the body on the line below.
 
   // The avatar is not drawn here. It is painted per frame by drawAvatars(), so that a face which
   // arrives after this row has been laid out still appears; baking it here would freeze whatever
@@ -414,32 +440,39 @@ double Panel::paintRow(cairo_t* cr, const Message& m, double x, double y, double
   double ty = y;
   outlined(nl, tx, ty, rgb(nc, alpha));
 
-  const double bodyX = tx + nw + tok_.nameBodyGap;
   // Emotes become object-replacement characters before layout, so pango does the line breaking and
   // places the placeholders. Each visual line is then split back at them and drawn as text runs
   // and pictures in a single pass.
   const InlineBody body = buildBody(m);
   pwvideo::LabelSpec bs = spec;
   bs.sizePx = tok_.fontBody;
-  bs.widthPx = std::max(20.0, avail - nw - tok_.nameBodyGap);  // the first line shares the row with the name
   bs.maxLines = 8;
-  PangoLayout* bl = text_.layout(cr, body.text, bs);
-
-  const int nLines = std::max(1, pango_layout_get_line_count(bl));
+  // A body that wraps beside the name is moved under it instead, on the row's full width; see
+  // fitBody(). Both this and measureRow() ask the same function, so they cannot disagree about the
+  // branch or about the width, which is what keeps an allocated row and a drawn row the same height.
+  const BodyFit fit = fitBody(cr, body.text, bs, avail - nw - tok_.nameBodyGap, avail);
+  PangoLayout* bl = fit.layout;
+  const int nLines = fit.lines;
   const double lh = lineAdvance();
+  // Stacked, the body starts one line down and flush with the name's left edge, so every line of it
+  // uses the whole row. Inline, it starts after "name:" on the line they share.
+  const double bodyX = fit.stacked ? tx : tx + nw + tok_.nameBodyGap;
+  if (fit.stacked) ty += lh;
 
   // The bar spans the whole content height of the row, so a wrapped message gets a bar as long as
-  // the text it belongs to. It is drawn here rather than before the body was laid out because its
-  // height is the line count -- and it cannot be painted over, being 4px from the edge while the
-  // text starts at padX. The margin below the row is left out on purpose: that is the gap to the
-  // next message, and a bar reaching into it would read as belonging to both rows.
+  // the text it belongs to -- including the name's line when the body is stacked below it. It is
+  // drawn here rather than before the body was laid out because its height is the line count -- and
+  // it cannot be painted over, being 4px from the edge while the text starts at padX. The margin
+  // below the row is left out on purpose: that is the gap to the next message, and a bar reaching
+  // into it would read as belonging to both rows.
   if (hasBar(m.kind)) {
     const pwvideo::Rgba bar = rgb(barColor(m), m.type == UserType::Normal ? 0.5 : 1.0);
     cairo_set_source_rgba(cr, bar.r, bar.g, bar.b, bar.a);
     // Square corners: the bar is flush against the panel edge, so rounding its ends would only
     // carve notches out of the very edge it is meant to sit on.
+    const int rowLines = nLines + (fit.stacked ? 1 : 0);
     cairo_rectangle(cr, x + tok_.barX, y + tok_.barInset, tok_.barWidth,
-                    std::max(static_cast<double>(nLines) * lh, avatarBox()) -
+                    std::max(static_cast<double>(rowLines) * lh, avatarBox()) -
                         tok_.barInset * 2.0);
     cairo_fill(cr);
   }

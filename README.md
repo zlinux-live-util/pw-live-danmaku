@@ -28,15 +28,15 @@ That is `--demo --dump` output at the default `480x1080`, and it covers every me
 
 It replaces the "OBS browser source plus a large blob of CSS reshaping the chat DOM" approach: the same picture, one process, zero child processes, none of it sitting in a browser.
 
-- **A chat panel**, not scrolling danmaku: bottom-aligned, per-role colours, a colour bar on the left, hanging indent on wrap
+- **A chat panel**, not scrolling danmaku: bottom-aligned, per-role colours, a colour bar on the left; a body that would wrap beside its name drops to the line below instead of squeezing into a narrow column
 - **Avatars** are fetched live and cropped to a circle; **emote messages** are drawn from the inline images Bilibili hands over
-- **Gifts, entries and likes** all land in the same column: the gift verb (`投喂`) is gold, the gift name that stands in when the icon has not arrived is pink, and both belong to the gift class together with the left colour bar; entries and likes are dimmed so they do not compete with what was actually typed
-- **Repeated gifts from one viewer merge into a row**: within a window they are grouped by viewer *and* gift with the count summed (`×10`) instead of spamming one row per tap; entry notices merge the same way
-- **Paid messages are pinned on their own layer**: top-aligned, wrapped and never truncated, dwell time of 1 minute to 2 hours by amount, several at once
+- **Gifts, entries, follows, shares and likes** all land in the same column: the gift verb (`投喂`) is gold, the gift name that stands in when the icon has not arrived is pink, and both belong to the gift class together with the left colour bar; entries, follows, shares and likes are dimmed so they do not compete with what was actually typed
+- **Repeated gifts from one viewer merge into a row**: within a window they are grouped by viewer *and* gift with the count summed (`×10`) instead of spamming one row per tap; entry notices merge the same way, while follows and shares get a row each
+- **Paid messages are pinned on their own layer**: top-aligned, wrapped and never truncated, dwell time taken from the site's own duration when it supplies one and otherwise from the published 1 minute to 2 hours price table, several at once
 - **Guard cards** are solid green and scroll with the list
 - **Entry animation**: a new message takes its slot immediately, pushes the old ones up, then slides in
 - **History across restarts**: `--history N` keeps the last N rows on disk and paints them back at the next start, above a rule that separates them from this session's live rows
-- **A local WebSocket feed**: `--ws [PORT]` broadcasts every row as one text frame — `avatarUrl`, `name`, `body`, tab-separated — and `--ws-rtf` styles the name and body with [Resonite rich-text tags](https://wiki.resonite.com/Text_formatting) for a text component that parses them
+- **A local WebSocket feed**: `--ws [PORT]` broadcasts every row as one typed text frame — an integer type (chat, gift, super chat, guard, entry, like, follow, share) followed by that type's tab-separated fields — and `--ws-rtf` styles the text fields with [Resonite rich-text tags](https://wiki.resonite.com/Text_formatting) for a text component that parses them. The wire format is specified in [docs/ws-protocol.md](docs/ws-protocol.md)
 - **Fully transparent by default**, with outlines on the text only, so it stays legible over bright content
 - **Any text is rendered literally** — a `<script>` in the chat is glyphs, nothing is parsed as markup
 - Any output size (`WxH`) and an adjustable frame-rate ceiling
@@ -163,7 +163,7 @@ The panel is laid out inside the canvas `--size` gives it: the width sets the wr
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--entry-merge MS` | `5000` | Entry-notice merge window: everyone who arrives within it becomes one row (`某某 等 7 人进入了直播间`). Measured in a busy room, entries arrive at 1.57/s against 0.36/s of chat, so one row each pushes most of what was typed off the top. `0` gives every notice its own row |
+| `--entry-merge MS` | `5000` | Entry-notice merge window: everyone who arrives within it becomes one row (`某某 等 7 人进入了直播间`). Measured in a busy room, entries arrive at 1.57/s against 0.36/s of chat, so one row each pushes most of what was typed off the top. `0` gives every notice its own row. Follows and shares are separate kinds and are not folded into this count |
 | `--gift-merge MS` | `3000` | Gift merge window: one viewer sending the same gift within it becomes one row with the count summed (`投喂 人气票 ×10`). Gift buttons are tapped repeatedly — ten taps would otherwise push ten real messages off the top. The key is **viewer + gift**, so one viewer sending two gifts is still two rows; the avatar is in the key too, because anonymous connections mask nicknames into the same few shapes. The row waits out the window, so a lone gift appears this much late. `0` gives every gift its own row |
 
 ### History across restarts
@@ -180,17 +180,23 @@ Paid messages are not kept: they are pinned with a dwell clock, and re-pinning y
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--ws [PORT]` | off; `8765` when given without a port | Serve every row on a local WebSocket: one text frame per message, three tab-separated fields — `avatarUrl`, `name`, `body`. Bound to `127.0.0.1`, plaintext and with no authentication, so it is a pipe for a consumer on this machine and **must not be exposed past it** |
-| `--ws-rtf` | | Wrap the name and body fields in [Resonite rich-text tags](https://wiki.resonite.com/Text_formatting): the role colour on the name, the gift accent on a gift's verb and name, `<alpha>` dimming on entry and like rows, and `<noparse>` around anything the viewer typed, so chat text cannot inject tags. Requires `--ws` |
+| `--ws [PORT]` | off; `8765` when given without a port | Serve every row on a local WebSocket: one text frame per row, tab-separated, with an integer type as the first field — `1` chat, `2` gift, `3` super chat, `4` membership, `5` entry, `6` like, `7` follow, `8` share. The remaining fields depend on the type; the full contract is [docs/ws-protocol.md](docs/ws-protocol.md). Bound to `127.0.0.1`, plaintext and with no authentication, so it is a pipe for a consumer on this machine and **must not be exposed past it** |
+| `--ws-rtf` | | Wrap the feed's text fields (name, content, a gift's verb and name) in [Resonite rich-text tags](https://wiki.resonite.com/Text_formatting): the role colour on the name, the gift accent on a gift's verb and name, `<alpha>` dimming on entry, like, follow and share rows, and `<noparse>` around anything the viewer typed, so chat text cannot inject tags. Numeric and avatar fields stay raw. Requires `--ws` |
 
-The frames carry the rows the panel drew, after `--entry-merge` and `--gift-merge`: ten taps of one gift button are one frame counting ten, not ten frames. Nothing is replayed, so a client that connects mid-stream sees the next message and nothing older. Real captured output at `--ws-rtf`, one frame per line (the avatar field is shown as `<url>` here):
+The frames carry the rows the panel drew, after `--entry-merge` and `--gift-merge`: ten taps of one gift button are one frame with `count=10`, not ten frames. Nothing is replayed, so a client that connects mid-stream sees the next row and nothing older. One frame per line below; `\t` stands for a literal tab and `<url>` for an avatar URL:
 
 ```text
-<url>	<color=#9AA0A6>Loyers</color>	直接下班吧
-	<alpha=#80><color=#9AA0A6>红桃老K_-</color></alpha>	<alpha=#80>等 9 人进入了直播间</alpha>
+1\tLoyers\t直接下班吧\t<url>
+2\t氧***\t投喂\t人气票\t10\t<url>
+3\t五条悟\t60000\t3000\t已经没有什么可怕的了\t<url>
+4\txfgryujk\t3\t19800\t
+5\tbili_30704624353\t9\t等 9 人进入了直播间\t
+6\tstrangeLex\t为主播点赞了\t<url>
+7\tl***\t关注了主播\t
+8\tl***\t分享了直播间\t
 ```
 
-The avatar field is a URL the panel itself fetched, and is empty on rows that have no avatar box, such as entry notices. The body keeps an emote as the token the sender typed (`[汤圆]`), because a text field cannot show the picture. A tab, newline or other control character in any field becomes a space, so chat text cannot split a field or add one. Any WebSocket client reads it: `websocat ws://127.0.0.1:8765/`, a browser console, or a Resonite WebSocket client.
+The type decides the layout. A chat frame is `type, user, content, avatar`; a gift is `type, user, verb, gift, count, avatar`; a super chat is `type, user, durationMs, amountCents, content, avatar`; a guard purchase is `type, user, guardLevel, amountCents, avatar`; an entry row is `type, user, count, content, avatar`; a like, follow or share is `type, user, content, avatar`. The avatar is the last defined field of every frame and is empty on rows that have no avatar box. The content keeps an emote as the token the sender typed (`[汤圆]`), because a text field cannot show the picture. A tab, newline or other control character in any field becomes a space, so chat text cannot split a field or add one. Any WebSocket client reads it: `websocat ws://127.0.0.1:8765/`, a browser console, or a Resonite WebSocket client. The full field-by-field specification, including the RTF tags and the money/duration units, is in [docs/ws-protocol.md](docs/ws-protocol.md).
 
 ### Output and diagnostics
 
@@ -225,6 +231,7 @@ The trick is that laid-out text never changes again, so the whole picture accumu
 | [docs/performance.md](docs/performance.md) | users, packagers | Measured CPU and memory, where the time goes, cutting CPU |
 | [docs/history.md](docs/history.md) | users, developers | Using the cross-restart history, and how it behaves |
 | [docs/cookies.md](docs/cookies.md) | users | Getting a cookie, passing it safely, `%h` versus `~` in a unit |
+| [docs/ws-protocol.md](docs/ws-protocol.md) | developers, integrators | The local WebSocket feed's frame format: type ids, field layouts, units and rich text |
 | [docs/development.md](docs/development.md) | contributors, packagers | Architecture, build flags and targets, repository layout, tests, dependency licences |
 
 The `docs/` articles are Chinese-only for now; both READMEs are maintained.

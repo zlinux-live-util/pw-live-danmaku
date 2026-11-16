@@ -62,11 +62,11 @@ int64_t steadyNowMs() {
 
 /** A field as it goes on the wire: control characters become spaces.
  *
- *  Tab is the one that matters -- a tab in the name or the body would split one message into four
- *  fields and a client that splits on tabs would read the rest of the body as an avatar URL -- but
- *  CR, LF and the rest are treated the same way, because a text component is single-line and a
- *  control character that survives to it is either invisible or a stray box. DEL is in for the same
- *  reason. Multi-byte UTF-8 never matches: every byte of a continuation is >= 0x80. */
+ *  Tab is the one that matters -- a tab in any text field would split one record into an extra
+ *  field, and a client that splits on tabs would read the rest of the content as a different field
+ *  -- but CR, LF and the rest are treated the same way, because a text component is single-line and
+ *  a control character that survives to it is either invisible or a stray box. DEL is in for the
+ *  same reason. Multi-byte UTF-8 never matches: every byte of a continuation is >= 0x80. */
 std::string wireField(std::string_view s) {
   std::string out(s);
   for (char& c : out) {
@@ -104,6 +104,43 @@ void appendStyled(std::string& out, uint32_t rgb, std::string_view text) {
   out += "</color>";
 }
 
+/** Leading and trailing whitespace removed. The gift verb is written with a trailing space so the
+ *  panel's text flow has a gap before the gift's picture; on the wire the verb and the name are
+ *  separate fields, so that separator belongs to the layout rather than to the verb. */
+std::string trim(std::string s) {
+  size_t begin = 0;
+  while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin]))) ++begin;
+  size_t end = s.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+  s.erase(end);
+  s.erase(0, begin);
+  return s;
+}
+
+/** One text field with the source's control characters already neutralised, wrapped in a colour.
+ *  An empty field stays empty rather than becoming an empty tag pair. */
+std::string styledField(std::string_view s, uint32_t rgb) {
+  const std::string clean = wireField(s);
+  if (clean.empty()) return {};
+  std::string out;
+  appendStyled(out, rgb, clean);
+  return out;
+}
+
+/** Text typed by a viewer: everything is literal, so '<' cannot open a tag. */
+std::string literalField(std::string_view s) {
+  std::string out;
+  appendLiteral(out, wireField(s));
+  return out;
+}
+
+/** The panel's half-strength treatment for the ambient kinds, on a field that may carry its own
+ *  colour tags. Empty stays empty so a missing name does not become an empty alpha pair. */
+std::string dimField(std::string text) {
+  if (text.empty()) return {};
+  return std::string(kRtfDim) + text + "</alpha>";
+}
+
 /** The name colour, in the panel's order of preference: the colour the sender chose, else the
  *  colour of their role. */
 uint32_t nameColor(const Message& m) {
@@ -116,47 +153,125 @@ uint32_t nameColor(const Message& m) {
   }
 }
 
+std::string userField(const Message& m, bool rtf, bool dim) {
+  if (!rtf) return wireField(m.user);
+  std::string out = styledField(m.user, nameColor(m));
+  return dim ? dimField(std::move(out)) : out;
+}
+
+std::string contentField(std::string_view s, bool rtf, bool dim) {
+  if (!rtf) return wireField(s);
+  std::string out = literalField(s);
+  return dim ? dimField(std::move(out)) : out;
+}
+
+/** The two text fields a gift carries separately: the site's verb and the gift's own name.
+ *
+ *  The count is removed first through withCount(0), which is the same call that wrote it: the
+ *  count is a field of its own on the wire, and leaving the rendered " ×6" inside the name would
+ *  make a client that counts rows count it twice. */
+struct GiftText {
+  std::string verb;
+  std::string name;
+};
+
+GiftText giftText(const Message& m) {
+  const Message base = m.withCount(0);
+  GiftText out;
+  for (const Fragment& f : base.parts) {
+    if (f.verb)
+      out.verb += f.text;
+    else
+      out.name += f.text;
+  }
+  out.verb = trim(std::move(out.verb));
+  out.name = trim(std::move(out.name));
+  return out;
+}
+
+WireType wireTypeOf(MsgKind kind) {
+  switch (kind) {
+    case MsgKind::Gift: return WireType::Gift;
+    case MsgKind::Paid: return WireType::SuperChat;
+    case MsgKind::Membership: return WireType::Membership;
+    case MsgKind::Entry: return WireType::Entry;
+    case MsgKind::Like: return WireType::Like;
+    case MsgKind::Follow: return WireType::Follow;
+    case MsgKind::Share: return WireType::Share;
+    case MsgKind::Text: break;
+  }
+  return WireType::Chat;
+}
+
+/** The wire's money unit is the cent, so a price never goes through a float. `amountValue` is in
+ *  whole units of the site's currency, which for bilibili is the yuan. */
+constexpr int64_t kCentsPerUnit = 100;
+
+std::string amountCentsField(const Message& m) {
+  return std::to_string(m.amountValue > 0 ? m.amountValue * kCentsPerUnit : 0);
+}
+
+std::string joinFields(const std::vector<std::string>& fields) {
+  std::string out;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) out += '\t';
+    out += fields[i];
+  }
+  return out;
+}
+
 }  // namespace
 
 std::string broadcastLine(const Message& m, bool rtf) {
-  std::string out = wireField(m.avatarUrl);
-  out += '\t';
+  std::vector<std::string> fields;
+  fields.push_back(std::to_string(static_cast<int>(wireTypeOf(m.kind))));
 
-  if (!rtf) {
-    out += wireField(m.user);
-    out += '\t';
-    // plainText() keeps an emote's token as the sender typed it, which is the best a text field
-    // can do with a picture: the token is what the panel falls back to as well when the image has
-    // not arrived.
-    out += wireField(m.plainText());
-    return out;
-  }
-
-  const bool dim = (m.kind == MsgKind::Entry || m.kind == MsgKind::Like);
-  if (dim) out += kRtfDim;
-  appendStyled(out, nameColor(m), wireField(m.user));
-  if (dim) out += "</alpha>";
-  out += '\t';
-
-  if (dim) out += kRtfDim;
-  for (const Fragment& f : m.parts) {
-    const std::string text = wireField(f.text);
-    if (text.empty()) continue;
-    if (f.verb) {
-      // The gift's "投喂" and the like's "为主播点赞了" are the verbs of their rows; on the panel
-      // they are the one run drawn in the accent colour rather than body white.
-      appendStyled(out, kVerbGift, text);
-    } else if (f.kind == Fragment::Kind::Emote && m.kind == MsgKind::Gift) {
-      // A gift picture cannot be a <sprite>: sprites resolve by name against a DynamicSpriteFont
-      // the client would have to have registered every gift in. Falling back to the token is what
-      // the panel does while the picture is in flight, and the pink is the colour it does it in.
-      appendStyled(out, kNameGift, text);
-    } else {
-      appendLiteral(out, text);
+  switch (m.kind) {
+    case MsgKind::Gift: {
+      const GiftText gift = giftText(m);
+      fields.push_back(userField(m, rtf, false));
+      fields.push_back(rtf ? styledField(gift.verb, kVerbGift) : wireField(gift.verb));
+      fields.push_back(rtf ? styledField(gift.name, kNameGift) : wireField(gift.name));
+      // One gift is still one; a count of zero means "not a counted row" on the model side.
+      fields.push_back(std::to_string(m.count > 0 ? m.count : 1));
+      break;
     }
+    case MsgKind::Paid:
+      fields.push_back(userField(m, rtf, false));
+      fields.push_back(std::to_string(m.durationMs > 0 ? m.durationMs : 0));
+      fields.push_back(amountCentsField(m));
+      fields.push_back(contentField(m.plainText(), rtf, false));
+      break;
+    case MsgKind::Membership:
+      fields.push_back(userField(m, rtf, false));
+      fields.push_back(std::to_string(m.guardLevel > 0 ? m.guardLevel : 0));
+      fields.push_back(amountCentsField(m));
+      break;
+    case MsgKind::Entry:
+      fields.push_back(userField(m, rtf, true));
+      // The content already says "等 N 人进入了直播间" when merged. The count is the same number
+      // without the sentence, for a client that wants to format the row itself.
+      fields.push_back(std::to_string(m.count > 0 ? m.count : 1));
+      fields.push_back(contentField(m.plainText(), rtf, true));
+      break;
+    case MsgKind::Like:
+    case MsgKind::Follow:
+    case MsgKind::Share:
+      fields.push_back(userField(m, rtf, true));
+      fields.push_back(contentField(m.plainText(), rtf, true));
+      break;
+    case MsgKind::Text:
+    default:
+      fields.push_back(userField(m, rtf, false));
+      fields.push_back(contentField(m.plainText(), rtf, false));
+      break;
   }
-  if (dim) out += "</alpha>";
-  return out;
+
+  // Last in every frame, and raw even under --ws-rtf: a client parses this, a person does not read
+  // it. A frame with no avatar box on the panel (an entry notice, a guard purchase) carries an
+  // empty field, which is still a field -- the tab before it is not omitted.
+  fields.push_back(wireField(m.avatarUrl));
+  return joinFields(fields);
 }
 
 WsServer::~WsServer() {

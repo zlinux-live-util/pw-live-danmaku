@@ -18,7 +18,7 @@ systemctl --user restart pw-live-danmaku             # 下次启动：旧消息�
 
 删历史直接 `rm` 那个文件即可，程序读不到就当没有历史启动。
 
-**醒目留言不入库**：它按金额算停留时间，把昨天的那条重新置顶是对付费时间撒谎。入场、礼物、点赞、
+**醒目留言不入库**：它按站方给的时长（没有时按金额）算停留时间，把昨天的那条重新置顶是对付费时间撒谎。入场、礼物、点赞、
 舰长卡片都是滚动列里的行，照常入库。
 
 ## 行为上的四点，都是踩过才知道的
@@ -74,8 +74,8 @@ deque push，`HistoryStore::add()` 不碰磁盘，只回答「现在该落盘了
 
 ### 六、醒目留言不入库
 
-醒目留言在置顶图层里按金额算停留时间（1 分钟～2 小时）。把昨天的那条重新置顶，等于对着观众谎报它
-是什么时候付的钱。
+醒目留言在置顶图层里按站方给的时长停留；站方没给时按金额查表（1 分钟～2 小时）。把昨天的那条
+重新置顶，等于对着观众谎报它是什么时候付的钱。
 
 ### 七、分割线是列里的一行，不是画面上的一层
 
@@ -127,7 +127,7 @@ ReadWritePaths=-%h/.config/pw-live-danmaku
 ```bash
 printf '%s' '{"format":1,"saved":"2026-10-04T12:00:00Z","room":"545068","messages":[
   {"kind":"text","type":"normal","user":"昨天的人","color":0,"avatar":"","ts":1791000000000,
-   "amount":"","amountValue":0,"count":0,"mergeKey":"",
+   "amount":"","amountValue":0,"durationMs":0,"guardLevel":0,"count":0,"mergeKey":"",
    "parts":[{"emote":0,"text":"这是上一次启动时留下的弹幕","url":"","px":0,"verb":false}]}]}' \
   > /tmp/h.json
 ./pw-live-danmaku --room 545068 --history 20 --history-file /tmp/h.json \

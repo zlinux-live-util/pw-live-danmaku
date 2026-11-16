@@ -50,6 +50,8 @@ Message sample(dwm::MsgKind kind, const std::string& user, const std::string& bo
   m.avatarUrl = "https://example.invalid/face.jpg";
   m.amount = "CN¥30";
   m.amountValue = 30;
+  m.durationMs = 60000;
+  m.guardLevel = 3;
   m.count = 6;
   m.mergeKey = "gift:1:2";
   m.tsMs = 1791046553806;
@@ -67,6 +69,8 @@ void checkSame(const Message& got, const Message& want, const char* what) {
   checkEq(got.avatarUrl, want.avatarUrl, what);
   checkEq(got.amount, want.amount, what);
   checkEq(got.amountValue, want.amountValue, what);
+  checkEq(got.durationMs, want.durationMs, what);
+  checkEq(got.guardLevel, want.guardLevel, what);
   checkEq(got.count, want.count, what);
   checkEq(got.mergeKey, want.mergeKey, what);
   checkEq(got.tsMs, want.tsMs, what);
@@ -91,6 +95,8 @@ void testRoundTrip() {
       sample(dwm::MsgKind::Membership, "观众丙", "舰长"),
       sample(dwm::MsgKind::Entry, "观众丁", "进入"),
       sample(dwm::MsgKind::Like, "观众戊", "点赞"),
+      sample(dwm::MsgKind::Follow, "观众己", "关注"),
+      sample(dwm::MsgKind::Share, "观众庚", "分享"),
   };
   int64_t t = 1000;
   for (const Message& m : want) store.add(m, t += 10000);  // each add is due, so every one saves

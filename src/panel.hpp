@@ -217,6 +217,28 @@ class Panel {
   std::vector<CardLine> cardLines(const Message& m, cairo_t* cr, double w) const;
   /** Height a card occupies in the list: its text plus padding, plus the gap below it. */
   double cardHeight(const Message& m, cairo_t* cr, double w) const;
+  /** A plain row's body, laid out and placed: beside the name when it fits there, or on lines of its
+   * own under the name when it would have to wrap. */
+  struct BodyFit {
+    /** TextRenderer's single layout, bound to the branch taken. Valid only until the next layout()
+     *  call, which is all either caller needs from it. */
+    PangoLayout* layout = nullptr;
+    /** Lines the body occupies in that layout. */
+    int lines = 1;
+    /** Whether the body starts on the line below the name rather than sharing the first line. */
+    bool stacked = false;
+  };
+  /** Lays the body out twice in the worst case: first on the width the first line has left after the
+   *  name, and -- if that wraps -- again across the row's full text width.
+   *
+   *  measureRow() and paintRow() both take their answer from here. They previously each decided the
+   *  wrap width themselves, and a disagreement between them is exactly how a row ends up allocated
+   *  one line short and overwritten by the next message. The branch itself exists for the narrow
+   *  panel: with the name taking most of the line, a wrapped body was left a column four characters
+   *  wide under the name -- correctly wrapped, and unreadable. Stacked, it gets the whole row width
+   *  and starts one line lower, aligned with the name's left edge. */
+  BodyFit fitBody(cairo_t* cr, const std::string& text, const pwvideo::LabelSpec& base,
+                  double inlineWidth, double fullWidth) const;
   double measureRow(const Message& m, cairo_t* cr, bool* isCard) const;
   /** Height the rule takes: air, the rule or its label -- whichever is taller -- and air again. */
   double dividerHeight(cairo_t* cr) const;
@@ -269,15 +291,21 @@ class Panel {
 
   /** Whether a row leaves room for an avatar.
    *
-   *  Entry notices do not: they arrive several times a second and every one is a different viewer,
-   *  so the column would become a strip of single-use faces that the avatar cache can never keep,
-   *  and most of them would be the site's default picture besides. */
-  static bool hasAvatarBox(MsgKind k) { return k != MsgKind::Entry; }
+   *  Entry, follow and share notices do not: entries arrive several times a second and every one is
+   *  a different viewer, so the column would become a strip of single-use faces that the avatar
+   *  cache can never keep, and most of them would be the site's default picture besides. Follows and
+   *  shares are rarer, but they are drawn in the same ambient column and keep the same rule. */
+  static bool hasAvatarBox(MsgKind k) {
+    return k != MsgKind::Entry && k != MsgKind::Follow && k != MsgKind::Share;
+  }
 
-  /** Whether a row is drawn with the coloured bar at the panel edge. The two ambient kinds are not:
+  /** Whether a row is drawn with the coloured bar at the panel edge. The ambient kinds are not:
    *  the bar is the loudest thing in a row, and these rows exist to sit under the chat rather than
    *  in it. A gift keeps one, because it is something a viewer paid for. */
-  static bool hasBar(MsgKind k) { return k != MsgKind::Entry && k != MsgKind::Like; }
+  static bool hasBar(MsgKind k) {
+    return k != MsgKind::Entry && k != MsgKind::Like && k != MsgKind::Follow &&
+           k != MsgKind::Share;
+  }
 
   /** Alpha the name and body of this kind are drawn at: dimAlpha for the ambient kinds, 1.0 for the
    *  rest. Applied to the name as well as the body, or a dimmed row would still show a full-bright

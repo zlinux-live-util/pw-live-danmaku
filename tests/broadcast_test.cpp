@@ -1,12 +1,13 @@
-// Unit tests for the outbound feed: the three-field line format with and without Resonite tags,
-// and the loopback server that carries it -- handshake, frame encoding, ping/pong, and the two
-// refusals a client can earn.
+// Unit tests for the outbound feed: the typed tab-separated line format with and without Resonite
+// tags, and the loopback server that carries it -- handshake, frame encoding, ping/pong, and the
+// two refusals a client can earn.
 //
-// The server side is tested over a real socket rather than against its own helpers. Frame encoding
-// is exactly the kind of code where a test that reuses the encoder's idea of a frame agrees with
-// the encoder and with nothing else; this the client side below re-derives from RFC 6455 instead.
-// The handshake is checked against the example nonce and accept value in section 1.3 of the RFC,
-// which is a fact about the RFC and not about this program.
+// The line format is the contract, so those tests split each record the way a client does -- on tabs
+// -- and assert the whole field vector. The server side is tested over a real socket rather than
+// against its own helpers. Frame encoding is exactly the kind of code where a test that reuses the
+// encoder's idea of a frame agrees with the encoder and with nothing else; this the client side
+// below re-derives from RFC 6455 instead. The handshake is checked against the example nonce and
+// accept value in section 1.3 of the RFC, which is a fact about the RFC and not about this program.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -46,24 +47,48 @@ using dwm::Message;
 using dwm::MsgKind;
 using dwm::UserType;
 
-size_t countOf(const std::string& s, char c) {
-  size_t n = 0;
-  for (const char x : s)
-    if (x == c) ++n;
-  return n;
+/** Splits a record into its fields. The format is the whole contract, so the tests read it the way a
+ *  client does -- by the tabs -- rather than rebuilding it from the same pieces. */
+std::vector<std::string> splitFields(const std::string& line) {
+  std::vector<std::string> fields;
+  size_t start = 0;
+  for (;;) {
+    const size_t tab = line.find('\t', start);
+    if (tab == std::string::npos) {
+      fields.push_back(line.substr(start));
+      return fields;
+    }
+    fields.push_back(line.substr(start, tab - start));
+    start = tab + 1;
+  }
 }
 
-/** Splits a line into its three fields. The format is the whole contract, so the tests read it the
- *  way a client does -- by the tabs -- rather than by rebuilding it from the same pieces. */
-bool fields3(const std::string& line, std::string& a, std::string& b, std::string& c) {
-  const size_t t1 = line.find('\t');
-  if (t1 == std::string::npos) return false;
-  const size_t t2 = line.find('\t', t1 + 1);
-  if (t2 == std::string::npos) return false;
-  a = line.substr(0, t1);
-  b = line.substr(t1 + 1, t2 - t1 - 1);
-  c = line.substr(t2 + 1);
-  return true;
+std::string describe(const std::vector<std::string>& fields) {
+  std::string out;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) out += " | ";
+    out += fields[i];
+  }
+  return out;
+}
+
+/** Asserts the whole field layout: count, order, and every value. A frame that gains a field, loses a
+ *  trailing empty one, or puts two of them in the other order is a different wire format. */
+void checkFields(const std::string& line, const std::vector<std::string>& want, const char* what) {
+  const std::vector<std::string> got = splitFields(line);
+  bool ok = got.size() == want.size();
+  if (ok) {
+    for (size_t i = 0; i < want.size(); ++i) {
+      if (got[i] != want[i]) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  if (ok) return;
+  std::fprintf(stderr, "FAIL: %s\n  got:  %s\n  want: %s\n", what, describe(got).c_str(),
+               describe(want).c_str());
+  ++failures;
 }
 
 Message chat() {
@@ -77,42 +102,36 @@ Message chat() {
   return m;
 }
 
-void testPlainLine() {
+void testChatFrame() {
+  const std::string avatar = "https://example.invalid/face.png";
   const Message m = chat();
-  std::string avatar, name, body;
-  const std::string line = dwm::broadcastLine(m, false);
-  check(fields3(line, avatar, name, body), "plain: three tab-separated fields");
-  checkEq(avatar, std::string("https://example.invalid/face.png"), "plain: avatar");
-  checkEq(name, std::string("哈基米"), "plain: name");
-  // An emote travels as the token the sender typed, the same text the panel falls back to.
-  checkEq(body, std::string("你[热]好"), "plain: emote token kept");
+  checkFields(dwm::broadcastLine(m, false), {"1", "哈基米", "你[热]好", avatar},
+              "plain: chat fields");
 
-  // A tab or a newline in the body must not survive into a field, or a client that splits on tabs
-  // reads the rest of the message as another field.
+  // A tab or a newline in any text field must not survive into a field, or a client that splits on
+  // tabs reads the rest of the message as another field. An emote travels as the token the sender
+  // typed, the same text the panel falls back to when the picture has not arrived.
   Message t = chat();
   t.parts.clear();
   t.parts.push_back(Fragment{Fragment::Kind::Text, "a\tb\nc\x7F", "", 0});
-  const std::string tampered = dwm::broadcastLine(t, false);
-  checkEq(countOf(tampered, '\t'), size_t(2), "plain: control characters cannot add fields");
-  checkEq(tampered, std::string("https://example.invalid/face.png\t哈基米\ta b c "),
-          "plain: control characters become spaces");
+  checkFields(dwm::broadcastLine(t, false), {"1", "哈基米", "a b c ", avatar},
+              "plain: control characters become spaces");
 }
 
-void testRtfLine() {
-  std::string avatar, name, body;
+void testChatRtf() {
+  const std::string avatar = "https://example.invalid/face.png";
 
   const Message m = chat();
-  check(fields3(dwm::broadcastLine(m, true), avatar, name, body), "rtf: three tab-separated fields");
-  checkEq(avatar, std::string("https://example.invalid/face.png"),
-          "rtf: the avatar stays a raw URL");
-  checkEq(name, std::string("<color=#0F9D58>哈基米</color>"), "rtf: member name in role colour");
-  checkEq(body, std::string("你[热]好"), "rtf: plain chat carries no tags of its own");
+  checkFields(dwm::broadcastLine(m, true),
+              {"1", "<color=#0F9D58>哈基米</color>", "你[热]好", avatar},
+              "rtf: member name in role colour, body untouched");
 
   // The colour the sender chose wins over the role colour, the same order the panel uses.
   Message coloured = chat();
   coloured.userColor = 0x123456;
-  check(fields3(dwm::broadcastLine(coloured, true), avatar, name, body), "rtf: coloured fields");
-  checkEq(name, std::string("<color=#123456>哈基米</color>"), "rtf: the sender's colour wins");
+  checkFields(dwm::broadcastLine(coloured, true),
+              {"1", "<color=#123456>哈基米</color>", "你[热]好", avatar},
+              "rtf: the sender's colour wins");
 
   // Chat text is data. A tag the viewer typed is shown as glyphs on the panel and must be shown as
   // glyphs here too -- which takes the wiki's counted noparse, because the closed form cannot wrap
@@ -120,32 +139,149 @@ void testRtfLine() {
   Message evil;
   evil.user = "x";
   evil.parts.push_back(Fragment{Fragment::Kind::Text, "<b>bold</b>", "", 0});
-  check(fields3(dwm::broadcastLine(evil, true), avatar, name, body), "rtf: injected-tag fields");
-  checkEq(body, std::string("<noparse=1><b>bold<noparse=1></b>"), "rtf: a typed tag is disarmed");
+  checkFields(dwm::broadcastLine(evil, true),
+              {"1", "<color=#9AA0A6>x</color>", "<noparse=1><b>bold<noparse=1></b>", ""},
+              "rtf: a typed tag is disarmed");
+}
 
-  // The gift verb and the gift's name keep the panel's accents; everything after them does not.
+void testGiftFrame() {
+  const std::string avatar = "https://example.invalid/gift.png";
   Message gift;
   gift.kind = MsgKind::Gift;
   gift.user = "氧***";
+  gift.avatarUrl = avatar;
   gift.parts.push_back(Fragment{Fragment::Kind::Text, "投喂 ", "", 0, true});
   gift.parts.push_back(Fragment{Fragment::Kind::Emote, "人气票", "", 0});
-  gift.parts.push_back(Fragment{Fragment::Kind::Text, " ×6", "", 0});
-  check(fields3(dwm::broadcastLine(gift, true), avatar, name, body), "rtf: gift fields");
-  checkEq(name, std::string("<color=#9AA0A6>氧***</color>"), "rtf: gift name keeps role colour");
-  checkEq(body,
-          std::string("<color=#F5C542>投喂 </color><color=#FB7299>人气票</color> ×6"),
-          "rtf: gift verb and gift name accents");
+  gift = gift.withCount(10);
 
-  // The ambient kinds arrive an order of magnitude faster than chat; the panel dims them, and so
-  // does the feed, on both fields so neither is left at full strength.
+  checkFields(dwm::broadcastLine(gift, false),
+              {"2", "氧***", "投喂", "人气票", "10", avatar}, "plain: gift fields");
+  checkFields(dwm::broadcastLine(gift, true),
+              {"2", "<color=#9AA0A6>氧***</color>", "<color=#F5C542>投喂</color>",
+               "<color=#FB7299>人气票</color>", "10", avatar},
+              "rtf: gift verb and gift name keep the panel's accents");
+
+  // A lone gift is still one; zero is the model's "not counted" sentinel. The rendered " ×10" is
+  // not part of the gift's name: count is its own field.
+  Message one = gift;
+  one.count = 0;
+  checkFields(dwm::broadcastLine(one, false),
+              {"2", "氧***", "投喂", "人气票", "1", avatar},
+              "plain: a gift with no count counts as one");
+
+  // Every gift text field is sanitised, and the verb's layout space is trimmed after it becomes a
+  // field of its own.
+  Message dirty = gift;
+  dirty.user = "a\tb";
+  dirty.parts[0].text = "投\t喂 ";
+  dirty.parts[1].text = "人\n气票";
+  checkFields(dwm::broadcastLine(dirty, false),
+              {"2", "a b", "投 喂", "人 气票", "10", avatar},
+              "plain: tabs in a gift cannot add fields");
+}
+
+void testSuperChatFrame() {
+  const std::string avatar = "https://example.invalid/face.png";
+  Message sc;
+  sc.kind = MsgKind::Paid;
+  sc.type = UserType::Member;
+  sc.user = "五条悟";
+  sc.avatarUrl = avatar;
+  sc.amountValue = 30;
+  sc.durationMs = 60000;
+  sc.parts.push_back(Fragment{Fragment::Kind::Text, "已经没有什么可怕的了", "", 0});
+
+  checkFields(dwm::broadcastLine(sc, false),
+              {"3", "五条悟", "60000", "3000", "已经没有什么可怕的了", avatar},
+              "plain: super chat fields");
+  checkFields(dwm::broadcastLine(sc, true),
+              {"3", "<color=#0F9D58>五条悟</color>", "60000", "3000",
+               "已经没有什么可怕的了", avatar},
+              "rtf: super chat name is styled, its numbers stay raw");
+
+  // A payload without user_info, price or time still yields a complete frame: the fields are zero
+  // or empty, never absent, and an empty name does not become an empty colour tag.
+  Message bare;
+  bare.kind = MsgKind::Paid;
+  checkFields(dwm::broadcastLine(bare, false), {"3", "", "0", "0", "", ""},
+              "plain: an unknown super chat field is zero, not missing");
+  checkFields(dwm::broadcastLine(bare, true), {"3", "", "0", "0", "", ""},
+              "rtf: an empty name stays empty");
+}
+
+void testMembershipFrame() {
+  Message m;
+  m.kind = MsgKind::Membership;
+  m.type = UserType::Member;
+  m.user = "xfgryujk";
+  m.guardLevel = 3;
+  m.amountValue = 198;
+
+  checkFields(dwm::broadcastLine(m, false), {"4", "xfgryujk", "3", "19800", ""},
+              "plain: membership fields");
+  checkFields(dwm::broadcastLine(m, true),
+              {"4", "<color=#0F9D58>xfgryujk</color>", "3", "19800", ""},
+              "rtf: membership name is styled, tier and price stay raw");
+}
+
+void testEntryFrame() {
   Message entry;
   entry.kind = MsgKind::Entry;
-  entry.user = "a";
-  entry.parts.push_back(Fragment{Fragment::Kind::Text, "进入了直播间", "", 0});
-  check(fields3(dwm::broadcastLine(entry, true), avatar, name, body), "rtf: entry fields");
-  checkEq(name, std::string("<alpha=#80><color=#9AA0A6>a</color></alpha>"),
-          "rtf: entry name dimmed");
-  checkEq(body, std::string("<alpha=#80>进入了直播间</alpha>"), "rtf: entry body dimmed");
+  entry.user = "bili_30704624353";
+  entry.count = 9;
+  entry.parts.push_back(Fragment{Fragment::Kind::Text, "等 9 人进入了直播间", "", 0});
+
+  checkFields(dwm::broadcastLine(entry, false),
+              {"5", "bili_30704624353", "9", "等 9 人进入了直播间", ""},
+              "plain: entry fields");
+  // The ambient kinds arrive an order of magnitude faster than chat; the panel dims them, and so
+  // does the feed, on both text fields so neither is left at full strength.
+  checkFields(dwm::broadcastLine(entry, true),
+              {"5", "<alpha=#80><color=#9AA0A6>bili_30704624353</color></alpha>", "9",
+               "<alpha=#80>等 9 人进入了直播间</alpha>", ""},
+              "rtf: entry name and content dimmed");
+}
+
+void testLikeFrame() {
+  const std::string avatar = "https://example.invalid/like.png";
+  Message like;
+  like.kind = MsgKind::Like;
+  like.user = "strangeLex";
+  like.avatarUrl = avatar;
+  like.parts.push_back(Fragment{Fragment::Kind::Text, "为主播点赞了", "", 0});
+
+  checkFields(dwm::broadcastLine(like, false),
+              {"6", "strangeLex", "为主播点赞了", avatar}, "plain: like fields");
+  checkFields(dwm::broadcastLine(like, true),
+              {"6", "<alpha=#80><color=#9AA0A6>strangeLex</color></alpha>",
+               "<alpha=#80>为主播点赞了</alpha>", avatar},
+              "rtf: like name and content dimmed");
+}
+
+void testFollowAndShareFrames() {
+  // Follow and share are the two interactions that used to be indistinguishable from an entry.
+  // They share the entry/like shape: type, user, content, avatar, with both text fields dimmed.
+  Message follow;
+  follow.kind = MsgKind::Follow;
+  follow.user = "l***";
+  follow.parts.push_back(Fragment{Fragment::Kind::Text, "关注了主播", "", 0});
+  checkFields(dwm::broadcastLine(follow, false), {"7", "l***", "关注了主播", ""},
+              "plain: follow fields");
+  checkFields(dwm::broadcastLine(follow, true),
+              {"7", "<alpha=#80><color=#9AA0A6>l***</color></alpha>",
+               "<alpha=#80>关注了主播</alpha>", ""},
+              "rtf: follow name and content dimmed");
+
+  Message share;
+  share.kind = MsgKind::Share;
+  share.user = "l***";
+  share.parts.push_back(Fragment{Fragment::Kind::Text, "分享了直播间", "", 0});
+  checkFields(dwm::broadcastLine(share, false), {"8", "l***", "分享了直播间", ""},
+              "plain: share fields");
+  checkFields(dwm::broadcastLine(share, true),
+              {"8", "<alpha=#80><color=#9AA0A6>l***</color></alpha>",
+               "<alpha=#80>分享了直播间</alpha>", ""},
+              "rtf: share name and content dimmed");
 }
 
 // --- the server ---------------------------------------------------------------------------------
@@ -310,10 +446,11 @@ void testServer() {
     check(buf.empty(), "server: the handshake left no bytes in the frame buffer");
     check(waitForClients(server, 1, 2000), "server: client counted after the handshake");
 
-    server.broadcast("face.png\tname\tbody");
+    server.broadcast("1\tname\tbody\tface.png");
     std::string payload;
     check(waitForFrame(fd, buf, 0x1, payload, 2000), "server: text frame arrived");
-    checkEq(payload, std::string("face.png\tname\tbody"), "server: payload survived the framing");
+    checkEq(payload, std::string("1\tname\tbody\tface.png"),
+            "server: payload survived the framing");
 
     // Several messages in a row, one of them past the 125-byte boundary where the length moves
     // into the extended field: each must arrive exactly once, in order. A queue that is re-flushed
@@ -456,8 +593,14 @@ void testStalledClient() {
 }  // namespace
 
 int main() {
-  testPlainLine();
-  testRtfLine();
+  testChatFrame();
+  testChatRtf();
+  testGiftFrame();
+  testSuperChatFrame();
+  testMembershipFrame();
+  testEntryFrame();
+  testLikeFrame();
+  testFollowAndShareFrames();
   testServer();
   testStalledClient();
   if (failures) {

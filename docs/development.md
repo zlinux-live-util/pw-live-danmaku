@@ -4,7 +4,7 @@
 
 协议与渲染层面的硬性约束、实测结论和踩过的坑在 [internals.md](internals.md)，**改渲染路径前先读
 那篇**。用户侧的三篇：历史 [history.md](history.md)、性能 [performance.md](performance.md)、
-凭据 [cookies.md](cookies.md)。
+凭据 [cookies.md](cookies.md)。要接本机弹幕源的客户端读 [ws-protocol.md](ws-protocol.md)。
 
 ## 架构
 
@@ -17,7 +17,7 @@
 | 素材获取 | 头像 / 表情 / 礼物图标 URL | 解码后的 cairo 表面（LRU 缓存） | `images` + `avatars` + 子模块的 `AssetCache`，后台线程下载 |
 | 版面渲染 | `Message` 列表 + 表面 | BGRA 帧（预乘 alpha） | `panel` + `notice`，cairo + pango |
 | 跨重启历史 | 行的增删 | 磁盘上的一个 JSON 文件 | `history`，原子写 + 节流，见 [history.md](history.md) |
-| 本机弹幕源 | 面板画出的同一行 | `127.0.0.1` 上的 WebSocket text 帧 | `broadcast`（`--ws` / `--ws-rtf`），见 [internals.md](internals.md) |
+| 本机弹幕源 | 面板画出的同一行 | `127.0.0.1` 上的类型化 WebSocket text 帧 | `broadcast`（`--ws` / `--ws-rtf`），格式见 [ws-protocol.md](ws-protocol.md) |
 | 视频输出 | BGRA 帧 | `Stream/Output/Video` 节点 | [`pw-video-simple-interface`](https://github.com/zlinux-live-util/pw-video-simple-interface)，libpipewire |
 
 `Message`（`src/message.hpp`）是整条链路的分界线：站点实现把各自的事件翻译成 `Message`，面板只把
@@ -108,15 +108,16 @@ Makefile 里的 `-I` 找到，没有这份数据库 clangd 解析不了 `pwvideo
 | `docs/history.md` | 跨重启历史的行为与实现 |
 | `docs/performance.md` | 性能实测数据与省开销的做法 |
 | `docs/cookies.md` | 凭据（cookie）的给法与 systemd 陷阱 |
+| `docs/ws-protocol.md` | 本机 WebSocket 弹幕源的帧格式规范（类型、字段、富文本） |
 | `docs/development.md` | 本文：架构、构建、目录结构、贡献约定 |
 | `Makefile` | 构建脚本，含 `test` / `verify` / `run` / `install-service` / `uninstall-service` / `compile-commands` 目标 |
 | `pw-live-danmaku.service` | systemd 用户服务模板，由 `make install-service` 渲染安装 |
 | `src/message.{hpp,cpp}` | `Message` 与 `Fragment`：与平台无关的消息模型（整条链路的分界线） |
 | `src/bili.{hpp,cpp}` | B 站引导、WBI 签名、JSON 事件解析、入场/礼物合并 |
 | `src/ws.{hpp,cpp}` | 自写的 RFC 6455 TLS WebSocket 客户端（OpenSSL，不引第三方）；握手 Accept 的计算导出给服务端复用 |
-| `src/broadcast.{hpp,cpp}` | 本机 WebSocket 弹幕源：三字段线格式、Resonite RTF 标签，以及 loopback 上的 RFC 6455 服务端（明文，单线程 poll） |
+| `src/broadcast.{hpp,cpp}` | 本机 WebSocket 弹幕源：类型化字段线格式（规范见 `docs/ws-protocol.md`）、Resonite RTF 标签，以及 loopback 上的 RFC 6455 服务端（明文，单线程 poll） |
 | `src/pb.{hpp,cpp}` | 无 schema 的 protobuf 读取器（`data.pb` 的 base64 blob） |
-| `src/notice.{hpp,cpp}` | 置顶图层：醒目留言与上舰卡片，按金额停留 |
+| `src/notice.{hpp,cpp}` | 置顶图层：醒目留言与上舰卡片，站方给了时长就用它，否则按金额停留 |
 | `src/panel.{hpp,cpp}` | cairo + pango 聊天面板：静态层 + 增量移位、左侧色条、折行 |
 | `src/images.{hpp,cpp}` | 表情与礼物图标的缓存（`ImageStore`） |
 | `src/avatars.{hpp,cpp}` | 头像缓存，每帧从行几何重画而不烘焙 |
@@ -124,7 +125,7 @@ Makefile 里的 `-I` 找到，没有这份数据库 clangd 解析不了 `pwvideo
 | `src/json.{hpp,cpp}` | 极简只读 JSON 解析器 |
 | `src/demo_faces.{hpp,cpp}` | `--demo` 的合成头像，让离线调版面也能看见头像框的位置 |
 | `src/main.cpp` | 模块组装、命令行解析、PipeWire 节点与渲染回调 |
-| `tests/` | `bili_test`（钉住原始 blob）、`history_test`（往返与窗口）、`json_test`、`broadcast_test`（线格式与握手/成帧） |
+| `tests/` | `bili_test`（钉住原始 blob）、`history_test`（往返与窗口）、`json_test`、`broadcast_test`（类型化线格式与握手/成帧） |
 | `lib/pw-video-simple-interface/` | git 子模块：视频节点（注册、缓冲、帧率协商）与 cairo 辅助模块（帧、文字、素材缓存、HTTP） |
 
 ## 依赖与许可
@@ -162,7 +163,7 @@ make test
 | `tests/bili_test.cpp` | **原始 blob**，不是重新拼的载荷——站方改打包方式会在这里失败，而不是变成一个悄悄空掉的画面；另有 WBI 签名的完整向量、表情切分规则 |
 | `tests/history_test.cpp` | 文件往返、窗口、节流，以及必须被拒绝的文件 |
 | `tests/json_test.cpp` | 只读 JSON 解析器 |
-| `tests/broadcast_test.cpp` | 弹幕线格式（含 RTF 转义）、RFC 6455 的示例握手向量、帧收发、ping/pong，以及两种拒连（未 mask 的帧、非 WebSocket 请求） |
+| `tests/broadcast_test.cpp` | 弹幕线格式：每种类型的字段数、顺序与值，RTF 转义；RFC 6455 的示例握手向量、帧收发、ping/pong，以及两种拒连（未 mask 的帧、非 WebSocket 请求） |
 | `tests/ws_test.cpp` | 客户端的成帧与消息层：分片重组（分片之间还插一个 ping）、二进制帧、close 回显、客户端帧的 mask 位；用一个自签证书的脚本 TLS 服务端驱动真实的 connect/握手/读路径 |
 
 端到端那一步是 `make verify`：挂一个消费者，把帧落盘，用文件大小反推尺寸（BGRA，逐帧

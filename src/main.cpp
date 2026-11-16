@@ -121,7 +121,8 @@ void usage(std::FILE* out) {
       "                     labelled with the number of people it stands for. Measured in a room\n"
       "                     with a million watchers they arrive at 1.6/s against 0.36/s of chat,\n"
       "                     so a row each pushes most of what was typed off the top. Default 5000;\n"
-      "                     0 gives every notice its own row as it arrives\n"
+      "                     0 gives every notice its own row as it arrives. Follow and share are\n"
+      "                     separate kinds and are not folded into this count\n"
       "  --gift-merge MS    Combine repeated gifts from one viewer into one row per this many\n"
       "                     milliseconds, counted. Keyed on the viewer *and* the gift, so a viewer\n"
       "                     tapping one gift button ten times gets one row counting ten instead of\n"
@@ -150,17 +151,21 @@ void usage(std::FILE* out) {
       "                     is missing or unreadable simply starts the overlay with no history\n"
       "  --history-label TEXT  Text on the rule between restored and live rows, default 上次.\n"
       "                     Empty draws the rule alone\n"
-      "  --ws [PORT]        Serve the same messages on a local WebSocket, so a second program can\n"
-      "                     read the chat without watching the picture. One text frame per\n"
-      "                     message, three tab-separated fields: avatar URL, name, body. The port\n"
-      "                     is optional and defaults to 8765. The socket is bound to 127.0.0.1\n"
-      "                     and has no TLS and no authentication: it is a pipe for a consumer on\n"
-      "                     this machine, and must not be exposed past it\n"
-      "  --ws-rtf           Wrap the name and body fields in Resonite rich-text tags (the wiki's\n"
-      "                     Text_formatting list) instead of leaving them plain: the role colour on\n"
-      "                     the name, the gift accent on a gift's verb and name, dimming on entry\n"
-      "                     and like rows, and <noparse> around whatever the viewer typed so chat\n"
-      "                     text cannot inject tags. Requires --ws\n"
+      "  --ws [PORT]        Serve the same rows on a local WebSocket, so a second program can\n"
+      "                     read the chat without watching the picture. One text frame per row,\n"
+      "                     tab-separated, with an integer type as the first field: 1 chat,\n"
+      "                     2 gift, 3 super chat, 4 membership, 5 entry, 6 like, 7 follow,\n"
+      "                     8 share. The rest of the fields depend on the type;\n"
+      "                     docs/ws-protocol.md is the full contract. The port is optional and\n"
+      "                     defaults to 8765. The socket is bound to 127.0.0.1 and has no TLS and\n"
+      "                     no authentication: it is a pipe for a consumer on this machine, and\n"
+      "                     must not be exposed past it\n"
+      "  --ws-rtf           Wrap the feed's text fields (name, content, a gift's verb and name) in\n"
+      "                     Resonite rich-text tags (the wiki's Text_formatting list) instead of\n"
+      "                     leaving them plain: the role colour on the name, the gift accent on a\n"
+      "                     gift's verb and name, dimming on entry, like, follow and share rows,\n"
+      "                     and <noparse> around whatever the viewer typed so chat text cannot\n"
+      "                     inject tags. Numeric and avatar fields stay raw. Requires --ws\n"
       "  --seconds N        Exit after N seconds (0 = never)\n"
       "  --demo             Draw a fixed set of messages and no network at all, for tuning the\n"
       "                     layout without a live room. Overrides --room.\n"
@@ -361,6 +366,8 @@ const char* kindTag(MsgKind k) {
     case MsgKind::Gift: return "[gift] ";
     case MsgKind::Entry: return "[entry] ";
     case MsgKind::Like: return "[like] ";
+    case MsgKind::Follow: return "[follow] ";
+    case MsgKind::Share: return "[share] ";
     default: return "";
   }
 }
@@ -464,8 +471,9 @@ void siteLoop(Shared& sh, Bili& bili, ImageStore& avatars, ImageStore& emoteImag
       // Entry notices carry no face on purpose -- one per viewer at 1.6/s is the wrong thing to
       // spend an avatar cache on -- so they must not land in this counter. The counter answers
       // "why is a row that has an avatar box showing a placeholder disc", and an entry notice has
-      // no avatar box to be wrong about.
-      if (m.kind != MsgKind::Entry) sh.noteAvatar(m.avatarUrl);
+      // no avatar box to be wrong about. Follow and share rows are the same ambient shape.
+      if (m.kind != MsgKind::Entry && m.kind != MsgKind::Follow && m.kind != MsgKind::Share)
+        sh.noteAvatar(m.avatarUrl);
       if (!m.avatarUrl.empty()) {
         // A URL we already have means two users share one picture. When that picture is the site's
         // default, several different people appear with the same flat disc, which reads as a
@@ -648,13 +656,14 @@ std::vector<Message> demoMessages() {
   after.parts.emplace_back(Fragment{Fragment::Kind::Text, "弹幕姬启动", "", 0});
   out.push_back(after);
 
-  // The three ambient kinds, interleaved with chat rather than listed at the end: the point of the
-  // demo is what the column looks like with them mixed in, and a block of them at the bottom would
-  // not show that. Two entries, because one row per viewer is the case that matters (no count) and
-  // the combined row is the other half of it. Two gifts, one with a count, because the count is the
-  // only part of that row that varies. The gift picture URL is left as it arrives in the demo: the
-  // offline path has no fetcher for it, so the icon falls back to the gift name as text -- which is
-  // the same thing the renderer does when the picture is merely late, and so is worth seeing here.
+  // The ambient kinds and the gifts, interleaved with chat rather than listed at the end: the point
+  // of the demo is what the column looks like with them mixed in, and a block of them at the bottom
+  // would not show that. Two entries, because one row per viewer is the case that matters (no count)
+  // and the combined row is the other half of it. One like, follow and share each, because they are
+  // separate ambient kinds now. Two gifts, one with a count, because the count is the only part of
+  // that row that varies. The gift picture URL is left as it arrives in the demo: the offline path
+  // has no fetcher for it, so the icon falls back to the gift name as text -- which is the same
+  // thing the renderer does when the picture is merely late, and so is worth seeing here.
   Message gift;
   gift.kind = MsgKind::Gift;
   gift.user = "氧***";
@@ -674,6 +683,18 @@ std::vector<Message> demoMessages() {
   like.parts.push_back(Fragment{Fragment::Kind::Text, "为主播点赞了", "", 0});
   out.push_back(like);
 
+  Message follow;
+  follow.kind = MsgKind::Follow;
+  follow.user = "十四的茶";
+  follow.parts.push_back(Fragment{Fragment::Kind::Text, "关注了主播", "", 0});
+  out.push_back(follow);
+
+  Message share;
+  share.kind = MsgKind::Share;
+  share.user = "懿曙";
+  share.parts.push_back(Fragment{Fragment::Kind::Text, "分享了直播间", "", 0});
+  out.push_back(share);
+
   Message giftMany;
   giftMany.kind = MsgKind::Gift;
   giftMany.user = "串***";
@@ -691,11 +712,14 @@ std::vector<Message> demoMessages() {
   // Every chat row asks for a synthetic face. Without this the demo draws no avatar at all, and a
   // missing avatar is indistinguishable from one drawn into the wrong box -- which is the whole
   // thing the red-and-green grids exist to reveal. The cards keep an empty URL, matching a live
-  // paid message, which has no face. The entry notices keep an empty one as well: that is what a
-  // live entry notice carries, and the row is laid out from that, not from a hypothetical face.
+  // paid message, which has no face. The entry, follow and share rows keep an empty one as well:
+  // that is what the live event carries, and the row is laid out from that, not from a hypothetical
+  // face. A like does keep its face, and is the one ambient row that does.
   int face = 0;
   for (Message& m : out) {
-    if (m.kind == MsgKind::Entry || isCard(m.kind)) continue;
+    if (m.kind == MsgKind::Entry || m.kind == MsgKind::Follow || m.kind == MsgKind::Share ||
+        isCard(m.kind))
+      continue;
     m.avatarUrl = demoFaceKey(face++);
   }
   return out;
@@ -1007,8 +1031,8 @@ int main(int argc, char** argv) {
         std::printf("  History: %s  [window %d rows, %zu restored]\n", history.path().c_str(),
                     o.historyRows, restored);
       if (o.wsPort > 0)
-        std::printf("  WebSocket: ws://127.0.0.1:%d/  [%s, one text frame per message]\n",
-                    feed.port(), o.wsRtf ? "Resonite RTF" : "avatar URL, name, body");
+        std::printf("  WebSocket: ws://127.0.0.1:%d/  [%s, one typed text frame per row]\n",
+                    feed.port(), o.wsRtf ? "Resonite RTF" : "plain text fields");
       std::fflush(stdout);
 
       std::thread avatarThread([&avatars] { avatars.runWorker(); });
@@ -1109,7 +1133,7 @@ int main(int argc, char** argv) {
                    o.count > 0 ? o.count : kDumpMessages, o.wsPort > 0 ? &feed : nullptr, o.wsRtf);
   if (o.wsPort > 0)
     std::printf("WebSocket: ws://127.0.0.1:%d/  [%s]\n", feed.port(),
-                o.wsRtf ? "Resonite RTF" : "avatar URL, name, body");
+                o.wsRtf ? "Resonite RTF" : "plain text fields");
   const int64_t until = steadyMs() + 90000;
   // Wait for a few messages rather than just the first: one row is not enough to judge a layout,
   // and a panel with real avatars in it needs more than one row to show them.

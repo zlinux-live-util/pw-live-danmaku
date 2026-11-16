@@ -161,7 +161,9 @@ void PinnedLayer::update(cairo_t* cr, const std::vector<Message>& fresh, int64_t
     PinnedNotice n;
     n.msg = m;
     n.shownAtMs = nowMs;
-    n.dwellMs = dwellFor(m.amountValue);
+    // The site's own duration wins when the payload carried one; the price table is the fallback
+    // for a payload that did not, and is still what the header's dwellFor() tests pin.
+    n.dwellMs = m.durationMs > 0 ? m.durationMs : dwellFor(m.amountValue);
     n.fadeMs = kFadeMs;
     // Newest first: the message that just arrived belongs at the top edge, where it is the most
     // prominent thing on the panel, and whatever is already up gets pushed down under it.

@@ -12,9 +12,10 @@
 //     (a server must not mask, a client must), the lifecycle differs, and the error model differs.
 //     Folding both into one class would cost more than the ~120 lines this file re-states.
 //
-// The format and the transport live in one module on purpose: the three tab-separated fields are
-// the server's contract with its clients, and a change to one without the other is a feed that
-// still connects and quietly says the wrong thing.
+// The format and the transport live in one module on purpose: the tab-separated fields are the
+// server's contract with its clients, and a change to one without the other is a feed that still
+// connects and quietly says the wrong thing. The contract itself is written down in
+// docs/ws-protocol.md; that document and broadcastLine() have to be edited together.
 //
 // Thread contract: broadcast() is called by the site thread as messages arrive; run() owns its own
 // thread. The queue between them is the only shared state, and it is behind one mutex.
@@ -36,24 +37,54 @@ namespace dwm {
  *  privileged: anything below 1024 would need help from the system to bind. */
 constexpr int kDefaultWsPort = 8765;
 
-/** The bytes broadcast for one message: three tab-separated fields -- avatar URL, name, body --
- *  and nothing else, so the framing is visible in a terminal and a client's split is trivial.
+/** The first field of every frame. These numbers are wire format, not implementation detail: a
+ *  client dispatches on them, so they must never be renumbered, only extended. 0 is reserved so a
+ *  zero can mean "not a frame" on the reading side. The full field layout per type is in
+ *  docs/ws-protocol.md. */
+enum class WireType : int {
+  /** An ordinary chat line. Fields: type, user, content, avatar. */
+  Chat = 1,
+  /** A gift. Fields: type, user, verb, gift, count, avatar. */
+  Gift = 2,
+  /** A pinned paid message (bilibili SUPER_CHAT). Fields: type, user, durationMs, amountCents,
+   *  content, avatar. */
+  SuperChat = 3,
+  /** A guard purchase (bilibili GUARD_BUY). Fields: type, user, guardLevel, amountCents, avatar. */
+  Membership = 4,
+  /** One or more entry notices folded into a row. Fields: type, user, count, content, avatar. */
+  Entry = 5,
+  /** A like. Fields: type, user, content, avatar. */
+  Like = 6,
+  /** Somebody followed the streamer. Fields: type, user, content, avatar. */
+  Follow = 7,
+  /** Somebody shared the room. Fields: type, user, content, avatar. */
+  Share = 8,
+};
+
+/** The bytes broadcast for one message: one tab-separated record, whose first field is the
+ *  WireType above and whose remaining fields depend on it. The layout per type is specified in
+ *  docs/ws-protocol.md and is the reason this function lives beside the server.
  *
  *  One message per WebSocket text frame, so a message boundary never has to be recovered from the
  *  payload. A message is not newline-terminated for the same reason: the frame already says where
  *  it ends, and a trailing newline only moves into whatever text component consumes it.
  *
  *  Control characters in every field become spaces, tabs above all. A tab inside the name or the
- *  body would split one message into four fields, and a client that splits on tabs would then read
- *  the rest of the body as an avatar URL. A chat message really can contain one: JSON carries a
- *  literal tab without complaint, so nothing upstream has ruled it out.
+ *  content would split one message into an extra field, and a client that splits on tabs would then
+ *  read the rest of the content as a different field. A chat message really can contain one: JSON
+ *  carries a literal tab without complaint, so nothing upstream has ruled it out.
  *
- *  With rtf, the name and body fields are wrapped in Resonite rich-text tags (the wiki's
- *  Text_formatting tag list): the name keeps the colour the panel gives it, a gift's verb and name
- *  keep theirs, the ambient kinds are dimmed with <alpha>, and any '<' the viewer typed is defused
- *  through <noparse=1> so chat text cannot inject formatting -- or malformed tags -- into the
- *  display. The avatar field stays raw: it is data a client parses, not text a person reads, and a
- *  colour tag around a URL would corrupt it. */
+ *  The avatar is the last defined field of every frame. A client reads the fields its type defines
+ *  and ignores anything after them, which leaves room to append fields in a later version without
+ *  moving a single existing one.
+ *
+ *  With rtf, the *text* fields -- user, content, and a gift's verb and name -- are wrapped in
+ *  Resonite rich-text tags (the wiki's Text_formatting tag list): the name keeps the colour the
+ *  panel gives it, a gift's verb and name keep theirs, the ambient kinds are dimmed with <alpha>,
+ *  and any '<' the viewer typed is defused through <noparse=1> so chat text cannot inject
+ *  formatting -- or malformed tags -- into the display. Numeric fields and the avatar stay raw: a
+ *  colour tag around a number or a URL would corrupt data a client parses rather than text a person
+ *  reads. */
 std::string broadcastLine(const Message& m, bool rtf);
 
 /** How many messages one client may fall behind before new ones are dropped for it. A reader that

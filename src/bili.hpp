@@ -135,7 +135,7 @@ class Bili {
    *  Six commands are read. Three of them are measured on this machine and verified:
    *
    *    DANMU_MSG           a typed chat line
-   *    INTERACT_WORD_V2    somebody entered the room   (protobuf, see below)
+   *    INTERACT_WORD_V2    somebody interacted: entered, followed or shared (protobuf, see below)
    *    SEND_GIFT_V2        somebody sent a gift         (protobuf, see below)
    *    LIKE_INFO_V3_CLICK  somebody liked the stream
    *
@@ -187,11 +187,16 @@ class Bili {
 
 /** Folds the entry notices into one row per window.
  *
- *  Measured in room 21852, about a million watchers: 110 INTERACT_WORD_V2 in 70 s against 25
- *  DANMU_MSG. Entries outnumber chat better than four to one, so a row each does not add
- *  information to the panel -- it pushes four fifths of what was actually typed off the top. The
- *  notices received since the last row are therefore shown together, named for the first of them
- *  and counted, which is what the site's own entry panel does with the same stream.
+ *  Measured in room 21852, about a million watchers: 110 INTERACT_WORD_V2 *entry* notices (msg_type
+ *  1 throughout that capture) in 70 s against 25 DANMU_MSG. Entries outnumber chat better than four
+ *  to one, so a row each does not add information to the panel -- it pushes four fifths of what was
+ *  actually typed off the top. The notices received since the last row are therefore shown
+ *  together, named for the first of them and counted, which is what the site's own entry panel does
+ *  with the same stream.
+ *
+ *  Only Entry goes through here. Follow and share arrive on the same cmd but are different kinds
+ *  now: a follow is a one-off event the streamer wants to read by itself, not a crowd count, so it
+ *  gets its own row rather than being folded into "等 N 人".
  *
  *  A window of 0 turns this off, and then every notice gets its own row exactly as it arrives. That
  *  is kept as a real option rather than treated as the degenerate case, because it is the honest

@@ -360,7 +360,7 @@ void testParseDanmakuBracketedEmoteToken() {
 void testParsePaidCard() {
   const std::string body =
       R"J({"cmd":"SUPER_CHAT_MESSAGE","data":{"medal_info":null,"message":"已经没有什么可怕的了")J"
-      R"J(,"price":30,"start_time":1791046553,"user_info":{"face":"http://i1.hdslb.com/bfs/face/x.jpg")J"
+      R"J(,"price":30,"time":60,"start_time":1791046553,"user_info":{"face":"http://i1.hdslb.com/bfs/face/x.jpg")J"
       R"J(,"guard_level":3,"uname":"五条悟"}}})J";
   Message m;
   check(Bili::parseMessage(Json::parse(body), m), "SUPER_CHAT_MESSAGE: recognised");
@@ -373,6 +373,7 @@ void testParsePaidCard() {
   // The pinned layer times a notice's dwell from the number, not from the string it is shown as, so
   // the price has to arrive in both forms.
   checkEqInt(m.amountValue, 30, "SC: price also carried as a number, for the dwell");
+  checkEqInt(m.durationMs, 60000LL, "SC: time is seconds, converted to milliseconds");
   checkEqInt(m.tsMs, 1791046553000LL, "SC: start_time is seconds, converted to ms");
   checkEqInt(static_cast<int>(m.type), static_cast<int>(UserType::Member),
              "SC: user_info.guard_level 3 is a guard, medal_info being null notwithstanding");
@@ -386,6 +387,7 @@ void testParsePaidCard() {
         "SUPER_CHAT_MESSAGE: a payload without user_info is still recognised");
   check(bare.user.empty() && bare.plainText() == "x",
         "SC: and keeps what it did carry rather than dropping the card");
+  checkEqInt(bare.durationMs, 0LL, "SC: a payload with no time leaves the duration unknown");
 }
 
 void testPinnedDwellTable() {
@@ -422,6 +424,9 @@ void testParseMembershipCard() {
   checkEqInt(static_cast<int>(m.kind), static_cast<int>(MsgKind::Membership), "GUARD: kind");
   checkEq(m.user, "xfgryujk", "GUARD: user");
   checkEq(m.amount, "舰长 · CN¥198", "GUARD: tier and price converted from gold");
+  checkEqInt(m.guardLevel, 3, "GUARD: the tier is carried as a number for the feed");
+  // 198000 gold is 198 yuan, and the feed's money unit is the cent.
+  checkEqInt(m.amountValue, 198LL, "GUARD: the price is also carried as whole yuan");
   checkEqInt(static_cast<int>(m.type), static_cast<int>(UserType::Member), "GUARD: membership tier");
 }
 
@@ -471,6 +476,24 @@ const std::string kEntryPb =
     "CkpodHRwczovL2kwLmhkc2xiLmNvbS9iZnMvbGl2ZS9iYjg4NzM0NTU4YzYzODNhNGNmYjVmYTE2Yzk3NDlkNTI5MGQ5NWU4"
     "LnBuZxIq5pu+57uP5rS76LeD6L+H77yM6L+R5pyf5LiO5L2g5LqS5Yqo6L6D5bCRGATCAQA=";
 
+// The same measured capture with field 5 (InteractWordV2.msg_type) changed from 1 to 2 and 3. Field
+// 5 is the published enum 1 enter / 2 follow / 3 share; only that one varint differs, so these pin
+// the classification without inventing a payload shape.
+const std::string kFollowPb =
+    "EgRsKioqIgEBKAIw3KoBOOm5h9YGQOncm6qQNEosCJOrIRATGgnmiZjpqazlpLQgpLqeBijAgYMGMMCBgwY4wIGDBmDcqgFo"
+    "4QtiAHi8h86T1djO7RiaAQCyAcABElIKBGwqKioSSmh0dHBzOi8vaTIuaGRzbGIuY29tL2Jmcy9mYWNlL2M1NjY2MWZlZTFh"
+    "MzhkZDg5NDRlOGRmYzczOGVhNjZjMjVjY2U0NmUuanBnGmQKCeaJmOmprOWktBATGMCBgwYgwIGDBijAgYMGMKS6ngY4hT1Q"
+    "k6shYOELegkjOTE5Mjk4Q0OCAQkjOTE5Mjk4Q0OKAQkjOTE5Mjk4Q0OSAQcjRkZGRkZGmgEJIzkxOTI5OEU2IgIIBzIAugF6"
+    "CkpodHRwczovL2kwLmhkc2xiLmNvbS9iZnMvbGl2ZS9iYjg4NzM0NTU4YzYzODNhNGNmYjVmYTE2Yzk3NDlkNTI5MGQ5NWU4"
+    "LnBuZxIq5pu+57uP5rS76LeD6L+H77yM6L+R5pyf5LiO5L2g5LqS5Yqo6L6D5bCRGATCAQA=";
+const std::string kSharePb =
+    "EgRsKioqIgEBKAMw3KoBOOm5h9YGQOncm6qQNEosCJOrIRATGgnmiZjpqazlpLQgpLqeBijAgYMGMMCBgwY4wIGDBmDcqgFo"
+    "4QtiAHi8h86T1djO7RiaAQCyAcABElIKBGwqKioSSmh0dHBzOi8vaTIuaGRzbGIuY29tL2Jmcy9mYWNlL2M1NjY2MWZlZTFh"
+    "MzhkZDg5NDRlOGRmYzczOGVhNjZjMjVjY2U0NmUuanBnGmQKCeaJmOmprOWktBATGMCBgwYgwIGDBijAgYMGMKS6ngY4hT1Q"
+    "k6shYOELegkjOTE5Mjk4Q0OCAQkjOTE5Mjk4Q0OKAQkjOTE5Mjk4Q0OSAQcjRkZGRkZGmgEJIzkxOTI5OEU2IgIIBzIAugF6"
+    "CkpodHRwczovL2kwLmhkc2xiLmNvbS9iZnMvbGl2ZS9iYjg4NzM0NTU4YzYzODNhNGNmYjVmYTE2Yzk3NDlkNTI5MGQ5NWU4"
+    "LnBuZxIq5pu+57uP5rS76LeD6L+H77yM6L+R5pyf5LiO5L2g5LqS5Yqo6L6D5bCRGATCAQA=";
+
 // SEND_GIFT_V2, one 人气票. Field 2 is the sender, 3 the face, 10 the gift, 13.1 the running combo
 // count -- which is deliberately *not* what the row shows as this message's count.
 const std::string kGiftPb =
@@ -506,6 +529,29 @@ void testParseEntryNotice() {
   // An entry notice is not a card. It reads as a chat row without a bar, and a card frame here
   // would be a visible slab around a one-line ambient event.
   check(!isCard(m.kind), "entry: not a card");
+}
+
+void testParseFollowAndShare() {
+  // Field 5 is the interaction type. A follow used to be stamped Entry and drawn as "进入了直播间",
+  // which is the one visible bug this split exists to fix.
+  Message follow;
+  check(Bili::parseMessage(Json::parse(blobDoc("INTERACT_WORD_V2", kFollowPb)), follow),
+        "follow: recognised");
+  checkEqInt(static_cast<int>(follow.kind), static_cast<int>(MsgKind::Follow), "follow: kind");
+  checkEq(follow.user, "l***", "follow: nickname from field 2");
+  checkEq(follow.plainText(), "关注了主播", "follow: body is a follow, not an entry");
+  checkEqInt(follow.tsMs, 1791089897065LL, "follow: field 8 is still the timestamp");
+  checkEq(follow.avatarUrl, "", "follow: no face is requested");
+  check(!isCard(follow.kind), "follow: not a card");
+
+  Message share;
+  check(Bili::parseMessage(Json::parse(blobDoc("INTERACT_WORD_V2", kSharePb)), share),
+        "share: recognised");
+  checkEqInt(static_cast<int>(share.kind), static_cast<int>(MsgKind::Share), "share: kind");
+  checkEq(share.user, "l***", "share: nickname from field 2");
+  checkEq(share.plainText(), "分享了直播间", "share: body is a share, not an entry");
+  checkEqInt(share.tsMs, 1791089897065LL, "share: field 8 is still the timestamp");
+  check(!isCard(share.kind), "share: not a card");
 }
 
 void testParseEntryNoticeRefusesUnusableBlobs() {
@@ -817,6 +863,7 @@ void testEntryMerger() {
   check(m.push(entry("A"), 0, out), "merger: the first notice is drawn immediately");
   checkEq(out.user, "A", "merger: it is named after the notice itself");
   checkEq(out.plainText(), "进入了直播间", "merger: one person reads as a plain verb");
+  checkEqInt(out.count, 1LL, "merger: a single notice is one person");
 
   check(!m.push(entry("B"), 200, out), "merger: one inside the window is folded, not drawn");
   check(!m.push(entry("C"), 400, out), "merger: and another");
@@ -828,6 +875,7 @@ void testEntryMerger() {
   check(m.flush(5000, out), "merger: due once the window has elapsed");
   checkEq(out.user, "B", "merger: the summary is named after the first of the batch");
   checkEq(out.plainText(), "等 2 人进入了直播间", "merger: the count covers the whole batch");
+  checkEqInt(out.count, 2LL, "merger: the number is carried beside the sentence");
   checkEqInt(m.pending(), 0, "merger: nothing is left over");
   check(!m.flush(100000, out), "merger: nothing to publish when the batch is empty");
 
@@ -871,6 +919,7 @@ void testEntryMergerFlushAllOnDisconnect() {
   check(m.flushAll(out), "flushAll: but the batch goes out anyway at the end of the stream");
   checkEq(out.user, "B", "flushAll: named after the first of the batch");
   checkEq(out.plainText(), "等 2 人进入了直播间", "flushAll: counted in full");
+  checkEqInt(out.count, 2LL, "flushAll: the structured count is in full too");
   checkEqInt(m.pending(), 0, "flushAll: nothing left over");
   check(!m.flushAll(out), "flushAll: and nothing to repeat");
   // The cooldown is not advanced by a forced flush -- there is no next window after the socket has
@@ -1052,6 +1101,7 @@ int main() {
   testPinnedDwellTable();
   testParseMembershipCard();
   testParseEntryNotice();
+  testParseFollowAndShare();
   testParseEntryNoticeRefusesUnusableBlobs();
   testProtobufBlobsDecodeFromEitherAlphabet();
   testParseGift();

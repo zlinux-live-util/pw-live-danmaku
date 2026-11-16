@@ -62,6 +62,8 @@ const char* kindName(MsgKind k) {
     case MsgKind::Gift: return "gift";
     case MsgKind::Entry: return "entry";
     case MsgKind::Like: return "like";
+    case MsgKind::Follow: return "follow";
+    case MsgKind::Share: return "share";
     case MsgKind::Text: break;
   }
   return "text";
@@ -73,6 +75,8 @@ MsgKind kindFromName(const std::string& s) {
   if (s == "gift") return MsgKind::Gift;
   if (s == "entry") return MsgKind::Entry;
   if (s == "like") return MsgKind::Like;
+  if (s == "follow") return MsgKind::Follow;
+  if (s == "share") return MsgKind::Share;
   return MsgKind::Text;
 }
 
@@ -107,6 +111,8 @@ void writeMessage(std::string& out, const Message& m) {
   out += ",\"amount\":";
   appendJsonString(out, m.amount);
   out += ",\"amountValue\":" + std::to_string(m.amountValue);
+  out += ",\"durationMs\":" + std::to_string(m.durationMs);
+  out += ",\"guardLevel\":" + std::to_string(m.guardLevel);
   out += ",\"count\":" + std::to_string(m.count);
   out += ",\"mergeKey\":";
   appendJsonString(out, m.mergeKey);
@@ -138,6 +144,8 @@ Message readMessage(const Json& j) {
   m.tsMs = j.get("ts").num();
   m.amount = j.get("amount").str();
   m.amountValue = j.get("amountValue").num();
+  m.durationMs = j.get("durationMs").num();
+  m.guardLevel = static_cast<int>(j.get("guardLevel").num());
   m.count = j.get("count").num();
   m.mergeKey = j.get("mergeKey").str();
   const Json& parts = j.get("parts");
